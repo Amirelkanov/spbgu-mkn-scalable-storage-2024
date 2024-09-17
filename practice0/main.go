@@ -14,30 +14,24 @@ func main() {
 	var mu sync.Mutex
 
 	go func() {
-		for {
-			mu.Lock()
-			filler(b[:len(b)/2], '0', '1')
-			mu.Unlock()
-			time.Sleep(1 * time.Second)
-		}
+		mu.Lock()
+		filler(b[:len(b)/2], '0', '1')
+		mu.Unlock()
+		time.Sleep(1 * time.Second)
 	}()
 
 	go func() {
-		for {
-			mu.Lock()
-			filler(b[len(b)/2:], 'X', 'Y')
-			mu.Unlock()
-			time.Sleep(1 * time.Second)
-		}
+		mu.Lock()
+		filler(b[len(b)/2:], 'X', 'Y')
+		mu.Unlock()
+		time.Sleep(1 * time.Second)
 	}()
 
 	go func() {
-		for {
-			mu.Lock()
-			fmt.Println(string(b[:]))
-			mu.Unlock()
-			time.Sleep(1 * time.Second)
-		}
+		mu.Lock()
+		fmt.Println(string(b[:]))
+		mu.Unlock()
+		time.Sleep(1 * time.Second)
 	}()
 
 	for {
