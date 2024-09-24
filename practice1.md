@@ -126,7 +126,7 @@ https://go.dev/wiki/TableDrivenTests
 Скелет наносервиса:
 
 ```
-struct Router {
+type Router struct {
   // поля
 }
 
@@ -205,3 +205,94 @@ HTTP endpoints:
   - Заменить сохранённый ранее `geojson` объект из `body` запроса
 - `POST {name}/delete`
   - Удалить сохранённый ранее `geojson` объект `id` из `body` запроса
+
+
+### Скелет приложения
+
+```golang
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+type Router struct {
+}
+
+func NewRouter(r *http.ServeMux) *Router {
+	result := Router{}
+
+	r.Handle("/", http.FileServer(http.Dir("../front/dist")))
+
+	r.Handle("/insert", http.RedirectHandler("/storage/insert", http.StatusTemporaryRedirect))
+	return &result
+}
+
+func (r *Router) Run() {
+
+}
+
+func (r *Router) Stop() {
+
+}
+
+type Storage struct {
+	name string
+}
+
+func NewStorage(r *http.ServeMux, name string) *Storage {
+	result := Storage{}
+
+	r.HandleFunc("/"+name+"/insert", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("hello world"))
+
+	})
+	return &result
+}
+
+func (r *Storage) Run() {
+
+}
+
+func (r *Storage) Stop() {
+
+}
+
+func main() {
+	r := http.ServeMux{}
+
+	router := NewRouter(&r)
+	router.Run()
+
+	storage := NewStorage(&r, "storage")
+	storage.Run()
+
+	l := http.Server{}
+	l.Addr = "127.0.0.1:8080"
+	l.Handler = &r
+
+	go func() {
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+		for _ = range sigs {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			l.Shutdown(ctx)
+		}
+	}()
+
+	defer slog.Info("we are going down")
+	slog.Info("listen http://" + l.Addr)
+	err := l.ListenAndServe() // http event loop
+	if !errors.Is(err, http.ErrServerClosed) {
+		slog.Info("err", "err", err)
+	}
+}
+```
