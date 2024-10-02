@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -55,7 +54,6 @@ func writeError(w http.ResponseWriter, err error) {
 type Storage struct {
 	name string
 	dir  string
-	mtx  sync.Mutex
 }
 
 func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool) *Storage {
@@ -64,7 +62,7 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool)
 		panic(err)
 	}
 
-	storage := Storage{name, wd + "/" + name, sync.Mutex{}}
+	storage := Storage{name, wd + "/" + name}
 
 	mux.HandleFunc("/"+name+"/insert", func(w http.ResponseWriter, r *http.Request) {
 		slog.Info("INSERT QUERY")
@@ -75,8 +73,6 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool)
 			writeError(w, err)
 			return
 		}
-
-		storage.mtx.Lock()
 
 		body, err := json.Marshal(feature)
 		if err != nil {
@@ -89,8 +85,6 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool)
 			writeError(w, err)
 			return
 		}
-
-		storage.mtx.Unlock()
 
 		w.WriteHeader(http.StatusOK)
 	})
@@ -105,7 +99,6 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool)
 			return
 		}
 
-		storage.mtx.Lock()
 		body, err := json.Marshal(feature)
 		if err != nil {
 			writeError(w, err)
@@ -117,7 +110,6 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool)
 			writeError(w, err)
 			return
 		}
-		storage.mtx.Unlock()
 
 		w.WriteHeader(http.StatusOK)
 	})
@@ -127,7 +119,6 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool)
 
 		featureCollection := geojson.NewFeatureCollection()
 
-		storage.mtx.Lock()
 		dirEntries, err := os.ReadDir(storage.dir)
 		if err != nil {
 			writeError(w, err)
@@ -149,7 +140,6 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool)
 			}
 			featureCollection.Append(&currFeature)
 		}
-		storage.mtx.Unlock()
 
 		body, err := json.Marshal(featureCollection)
 		if err != nil {
@@ -175,12 +165,10 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool)
 			return
 		}
 
-		storage.mtx.Lock()
 		err = os.Remove(storage.dir + "/" + feature.ID.(string) + ".json")
 		if err != nil {
 			writeError(w, err)
 		}
-		storage.mtx.Unlock()
 
 		w.WriteHeader(http.StatusOK)
 	})
