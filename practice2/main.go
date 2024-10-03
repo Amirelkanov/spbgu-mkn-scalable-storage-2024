@@ -24,12 +24,15 @@ const (
 	Insert Action = iota
 	Replace
 	Delete
+	Select
 	Snapshot
 )
 
 type Router struct {
 	// Поля
 }
+
+// TODO: Message сделай и канал chan Message
 
 type Storage struct {
 	name          string
@@ -99,48 +102,36 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool)
 
 	mux.HandleFunc("/"+name+"/insert", func(w http.ResponseWriter, r *http.Request) {
 		slog.Info("INSERT QUERY")
-		handleDbQuery(w, r, storage, name, Insert)
+		handlePostRequest(w, r, storage, name, Insert)
 	})
 
 	mux.HandleFunc("/"+name+"/replace", func(w http.ResponseWriter, r *http.Request) {
 		slog.Info("REPLACE QUERY")
-		handleDbQuery(w, r, storage, name, Replace)
+		handlePostRequest(w, r, storage, name, Replace)
 	})
 
 	mux.HandleFunc("/"+name+"/delete", func(w http.ResponseWriter, r *http.Request) {
 		slog.Info("DELETE QUERY")
-		handleDbQuery(w, r, storage, name, Delete)
+		handlePostRequest(w, r, storage, name, Delete)
 	})
 
 	// GET запросы
 	mux.HandleFunc("/"+name+"/checkpoint", func(w http.ResponseWriter, r *http.Request) {
 		slog.Info("SAVING SNAPSHOT...")
-
-		storage.transactionCh <- Transaction{Name: name, Action: Snapshot}
-		engineResp := <-storage.engineRespCh
-
-		if engineResp == nil {
-			_, err := fmt.Fprintf(w, "Checkpoint has been saved!")
-			if err != nil {
-				panic(err.Error())
-			}
-			w.WriteHeader(http.StatusOK)
-		} else {
-			writeError(w, engineResp)
-		}
+		handleGetRequest(w, r, storage, name, Snapshot)
 	})
 
 	// TODO: НЕ ЗАБУДЬ ЗАКРЫТЬ файлы!
 	// TODO: сделать (просят использовать rtree)
 	mux.HandleFunc("/"+name+"/select", func(w http.ResponseWriter, r *http.Request) {
 		slog.Info("SELECT QUERY...")
-		//handleAction(w, r, storage, name, Snapshot)
+		handleGetRequest(w, r, storage, name, Snapshot)
 	})
 
 	return &storage
 }
 
-func handleDbQuery(w http.ResponseWriter, r *http.Request, storage Storage, name string, action Action) {
+func handlePostRequest(w http.ResponseWriter, r *http.Request, storage Storage, name string, action Action) {
 	var feature geojson.Feature
 	err := json.NewDecoder(r.Body).Decode(&feature)
 
@@ -154,6 +145,21 @@ func handleDbQuery(w http.ResponseWriter, r *http.Request, storage Storage, name
 
 	if engineResp == nil {
 		w.WriteHeader(http.StatusOK)
+	} else {
+		writeError(w, engineResp)
+	}
+}
+
+func handleGetRequest(w http.ResponseWriter, r *http.Request, storage Storage, name string, action Action) {
+	storage.transactionCh <- Transaction{Name: name, Action: action}
+	engineResp := <-storage.engineRespCh
+
+	if engineResp == nil {
+		w.WriteHeader(http.StatusOK)
+		_, err := fmt.Fprintf(w, "OK")
+		if err != nil {
+			panic(err.Error())
+		}
 	} else {
 		writeError(w, engineResp)
 	}
@@ -204,6 +210,7 @@ func runEngine(s *Storage) {
 				return
 
 			case tr := <-s.transactionCh:
+
 				tr.Lsn = Engine.lsnCounter
 				err = runTransaction(&Engine, tr)
 				if err != nil {
@@ -312,12 +319,21 @@ func runTransaction(e *DBEngine, transaction Transaction) error {
 	switch transaction.Action {
 	case Insert:
 		e.features[transaction.Feature.ID.(string)] = transaction.Feature
+		e.rt.Insert(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
 	case Replace:
 		e.features[transaction.Feature.ID.(string)] = transaction.Feature
+
+		e.rt.Delete(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
+		e.rt.Insert(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
 	case Delete:
 		delete(e.features, transaction.Feature.ID.(string))
+		e.rt.Delete(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
 	case Snapshot:
 		return saveSnapshot(e)
+	case Select:
+		return nil
+	default:
+		return errors.ErrUnsupported
 	}
 	return nil
 }
