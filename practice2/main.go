@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"github.com/paulmach/orb/geojson"
 	"github.com/tidwall/rtree"
 	"log/slog"
@@ -32,12 +31,15 @@ type Router struct {
 	// Поля
 }
 
-// TODO: Message сделай и канал chan Message
+type Message struct {
+	err  error
+	body []byte
+}
 
 type Storage struct {
 	name          string
 	transactionCh chan Transaction
-	engineRespCh  chan error
+	engineRespCh  chan Message
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -98,8 +100,9 @@ func writeError(w http.ResponseWriter, err error) {
 
 func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool) *Storage {
 	ctx, cancel := context.WithCancel(context.Background())
-	storage := Storage{name, make(chan Transaction), make(chan error), ctx, cancel}
+	storage := Storage{name, make(chan Transaction), make(chan Message), ctx, cancel}
 
+	// POST запросы
 	mux.HandleFunc("/"+name+"/insert", func(w http.ResponseWriter, r *http.Request) {
 		slog.Info("INSERT QUERY")
 		handlePostRequest(w, r, storage, name, Insert)
@@ -116,16 +119,15 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool)
 	})
 
 	// GET запросы
-	mux.HandleFunc("/"+name+"/checkpoint", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/"+name+"/checkpoint", func(w http.ResponseWriter, _ *http.Request) {
 		slog.Info("SAVING SNAPSHOT...")
-		handleGetRequest(w, r, storage, name, Snapshot)
+		handleGetRequest(w, storage, name, Snapshot)
 	})
 
-	// TODO: НЕ ЗАБУДЬ ЗАКРЫТЬ файлы!
 	// TODO: сделать (просят использовать rtree)
-	mux.HandleFunc("/"+name+"/select", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/"+name+"/select", func(w http.ResponseWriter, _ *http.Request) {
 		slog.Info("SELECT QUERY...")
-		handleGetRequest(w, r, storage, name, Snapshot)
+		handleGetRequest(w, storage, name, Select)
 	})
 
 	return &storage
@@ -142,32 +144,30 @@ func handlePostRequest(w http.ResponseWriter, r *http.Request, storage Storage, 
 
 	storage.transactionCh <- Transaction{Name: name, Action: action, Feature: &feature}
 	engineResp := <-storage.engineRespCh
-
-	if engineResp == nil {
+	if engineResp.err == nil {
 		w.WriteHeader(http.StatusOK)
 	} else {
-		writeError(w, engineResp)
+		writeError(w, engineResp.err)
 	}
 }
 
-func handleGetRequest(w http.ResponseWriter, r *http.Request, storage Storage, name string, action Action) {
+func handleGetRequest(w http.ResponseWriter, storage Storage, name string, action Action) {
 	storage.transactionCh <- Transaction{Name: name, Action: action}
 	engineResp := <-storage.engineRespCh
-
-	if engineResp == nil {
+	if engineResp.err == nil {
 		w.WriteHeader(http.StatusOK)
-		_, err := fmt.Fprintf(w, "OK")
+		_, err := w.Write(engineResp.body)
 		if err != nil {
 			panic(err.Error())
 		}
 	} else {
-		writeError(w, engineResp)
+		writeError(w, engineResp.err)
 	}
 }
 
-func (s *Storage) Run() {
+func (s *Storage) Run(snapshotsDir string, logFilename string) {
 	slog.Info("Starting storage '" + s.name + "'...")
-	runEngine(s)
+	runEngine(s, snapshotsDir, logFilename)
 }
 
 func (s *Storage) Stop() {
@@ -184,24 +184,18 @@ func (s *Storage) Stop() {
 Замечание: Применяя действия с журнала, мы опять заполним его теми же транзакциями, но при этом текущая БД уже будет
 иметь отличные от ласт (на момент запуска runEngine) snapshot'а данные. Поэтому после считывания всех данных мы будем делать сразу же snapshot
 */
-func runEngine(s *Storage) {
+func runEngine(s *Storage, snapshotsDir string, logFilename string) {
 	go func() {
-		Engine := DBEngine{map[string]*geojson.Feature{}, rtree.RTree{}, 0, "snapshots/", s.name + ".ldf"}
+		Engine := DBEngine{map[string]*geojson.Feature{}, rtree.RTree{}, 0, snapshotsDir, logFilename}
 
 		err := initEngine(&Engine)
 		if err != nil {
 			panic(err.Error())
 		}
 
-		if err = saveSnapshot(&Engine); err != nil {
+		if _, err = saveSnapshot(&Engine); err != nil {
 			panic(err.Error())
 		}
-
-		logFd, err := os.OpenFile(Engine.logFilename, os.O_WRONLY|os.O_APPEND, 0666)
-		if err != nil {
-			panic(err.Error())
-		}
-		defer logFd.Close()
 
 		// Слушаем
 		for {
@@ -210,13 +204,19 @@ func runEngine(s *Storage) {
 				return
 
 			case tr := <-s.transactionCh:
-
 				tr.Lsn = Engine.lsnCounter
-				err = runTransaction(&Engine, tr)
+				msg, err := runTransaction(&Engine, tr)
 				if err != nil {
-					s.engineRespCh <- err
+					s.engineRespCh <- Message{err: err}
 				} else {
-					s.engineRespCh <- writeTransactionToFile(logFd, tr)
+					logFd, err := os.OpenFile(Engine.logFilename, os.O_WRONLY|os.O_APPEND, 0666)
+					if err != nil {
+						panic(err.Error())
+					}
+					s.engineRespCh <- Message{err: writeTransactionToFile(logFd, tr), body: msg}
+					if err = logFd.Close(); err != nil {
+						panic(err.Error())
+					}
 				}
 				Engine.lsnCounter++
 			}
@@ -235,7 +235,8 @@ func initEngine(e *DBEngine) error {
 		return err
 	}
 
-	if err = runTransactionsFromFile(e, e.snapshotsDir+snapshot); err != nil && !os.IsNotExist(err) { // Пытаемся считать последний snapshot
+	// Пытаемся считать последний snapshot
+	if err = runTransactionsFromFile(e, e.snapshotsDir+snapshot); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 
@@ -254,38 +255,46 @@ func initEngineFiles(logFilename string, snapshotsDir string) error {
 	}
 
 	// Создадим журнал, если его нет
-	if _, err := os.Stat(logFilename); err != nil {
-		if _, err = os.Create(logFilename); err != nil {
-			return err
-		}
+	file, err := os.OpenFile(logFilename, os.O_RDWR|os.O_CREATE, 0777)
+	if err != nil {
+		return err
 	}
+	defer func(file *os.File) {
+		if err = file.Close(); err != nil {
+			return
+		}
+	}(file)
 
 	return nil
 }
 
-func saveSnapshot(e *DBEngine) error {
-	file, err := os.OpenFile(
-		e.snapshotsDir+"snapshot-"+time.Now().Format(SnapshotDateFormat)+".ckp",
-		os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666,
-	)
+// Сохраняет snapshot и возвращает пару: (название snapshot'а, ошибка | nil)
+func saveSnapshot(e *DBEngine) (string, error) {
+	snapshotFilename := e.snapshotsDir + "snapshot-" + time.Now().Format(SnapshotDateFormat) + ".ckp"
+	file, err := os.OpenFile(snapshotFilename, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
 	if err != nil {
-		return err
+		return "", err
 	}
-	defer file.Close()
+
+	defer func(file *os.File) {
+		if err = file.Close(); err != nil {
+			return
+		}
+	}(file)
 
 	for _, feature := range e.features {
 		// Сохраняю типа транзакции
 		if err = writeTransactionToFile(file, Transaction{Action: Insert, Feature: feature}); err != nil {
-			return err
+			return "", err
 		}
 	}
 
 	// Чистим журнал после создания snapshot'а
 	if err = cleanLog(e.logFilename); err != nil {
-		return err
+		return "", err
 	}
 
-	return nil
+	return "", nil
 }
 
 func getLastSnapshotFilename(snapshotsDir string) (string, error) {
@@ -315,7 +324,7 @@ func cleanLog(filename string) error {
 }
 
 // TODO: сюда еще Rtree научиться бы поддерживать + select
-func runTransaction(e *DBEngine, transaction Transaction) error {
+func runTransaction(e *DBEngine, transaction Transaction) ([]byte, error) {
 	switch transaction.Action {
 	case Insert:
 		e.features[transaction.Feature.ID.(string)] = transaction.Feature
@@ -329,18 +338,28 @@ func runTransaction(e *DBEngine, transaction Transaction) error {
 		delete(e.features, transaction.Feature.ID.(string))
 		e.rt.Delete(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
 	case Snapshot:
-		return saveSnapshot(e)
+		snapshotFilename, err := saveSnapshot(e)
+		return []byte("Snapshot " + snapshotFilename + " has been saved in '" + e.snapshotsDir + "'!"), err
 	case Select:
-		return nil
+		// Честно, не понимаю, зачем нужен rtree для select'а всего: rtree полезен здесь для поиска геометрических объектов, находящихся в какой-либо области, но ладно
+		marshal, err := json.Marshal(e.features)
+		if err != nil {
+			return nil, err
+		}
+		return marshal, nil
 	default:
-		return errors.ErrUnsupported
+		return nil, errors.ErrUnsupported
 	}
-	return nil
+	return nil, nil
 }
 
 func runTransactionsFromFile(e *DBEngine, filename string) error {
 	file, err := os.Open(filename)
-	defer file.Close()
+	defer func(file *os.File) {
+		if err = file.Close(); err != nil {
+			return
+		}
+	}(file)
 
 	if err != nil {
 		return err
@@ -352,7 +371,7 @@ func runTransactionsFromFile(e *DBEngine, filename string) error {
 			return err
 		}
 
-		if err = runTransaction(e, tmpTr); err != nil {
+		if _, err = runTransaction(e, tmpTr); err != nil {
 			return err
 		}
 	}
@@ -380,7 +399,7 @@ func main() {
 	router.Run()
 
 	storage := NewStorage(&mux, "test", []string{}, true)
-	storage.Run()
+	storage.Run("snapshots/", storage.name+".ldf")
 
 	server := http.Server{
 		Addr:    "127.0.0.1:8080",
