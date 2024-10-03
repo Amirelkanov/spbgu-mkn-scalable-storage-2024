@@ -37,7 +37,8 @@ type Message struct {
 }
 
 type Storage struct {
-	name          string
+	name string
+
 	transactionCh chan Transaction
 	engineRespCh  chan Message
 
@@ -46,8 +47,8 @@ type Storage struct {
 }
 
 type DBEngine struct {
-	features map[string]*geojson.Feature
-	rt       rtree.RTree
+	featuresPrimInd map[string]*geojson.Feature
+	featuresRTree   rtree.RTreeG[*geojson.Feature]
 
 	lsnCounter uint64
 
@@ -124,7 +125,6 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool)
 		handleGetRequest(w, storage, name, Snapshot)
 	})
 
-	// TODO: сделать (просят использовать rtree)
 	mux.HandleFunc("/"+name+"/select", func(w http.ResponseWriter, _ *http.Request) {
 		slog.Info("SELECT QUERY...")
 		handleGetRequest(w, storage, name, Select)
@@ -186,7 +186,7 @@ func (s *Storage) Stop() {
 */
 func runEngine(s *Storage, snapshotsDir string, logFilename string) {
 	go func() {
-		Engine := DBEngine{map[string]*geojson.Feature{}, rtree.RTree{}, 0, snapshotsDir, logFilename}
+		Engine := DBEngine{map[string]*geojson.Feature{}, rtree.RTreeG[*geojson.Feature]{}, 0, snapshotsDir, logFilename}
 
 		err := initEngine(&Engine)
 		if err != nil {
@@ -282,7 +282,7 @@ func saveSnapshot(e *DBEngine) (string, error) {
 		}
 	}(file)
 
-	for _, feature := range e.features {
+	for _, feature := range e.featuresPrimInd {
 		// Сохраняю типа транзакции
 		if err = writeTransactionToFile(file, Transaction{Action: Insert, Feature: feature}); err != nil {
 			return "", err
@@ -294,7 +294,7 @@ func saveSnapshot(e *DBEngine) (string, error) {
 		return "", err
 	}
 
-	return "", nil
+	return snapshotFilename, nil
 }
 
 func getLastSnapshotFilename(snapshotsDir string) (string, error) {
@@ -323,26 +323,34 @@ func cleanLog(filename string) error {
 	return os.Truncate(filename, 0)
 }
 
-// TODO: сюда еще Rtree научиться бы поддерживать + select
 func runTransaction(e *DBEngine, transaction Transaction) ([]byte, error) {
 	switch transaction.Action {
 	case Insert:
-		e.features[transaction.Feature.ID.(string)] = transaction.Feature
-		e.rt.Insert(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
+		e.featuresPrimInd[transaction.Feature.ID.(string)] = transaction.Feature
+		e.featuresRTree.Insert(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
 	case Replace:
-		e.features[transaction.Feature.ID.(string)] = transaction.Feature
+		e.featuresPrimInd[transaction.Feature.ID.(string)] = transaction.Feature
 
-		e.rt.Delete(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
-		e.rt.Insert(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
+		e.featuresRTree.Replace(
+			transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, e.featuresPrimInd[transaction.Feature.ID.(string)],
+			transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature,
+		)
 	case Delete:
-		delete(e.features, transaction.Feature.ID.(string))
-		e.rt.Delete(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
+		delete(e.featuresPrimInd, transaction.Feature.ID.(string))
+		e.featuresRTree.Delete(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
 	case Snapshot:
 		snapshotFilename, err := saveSnapshot(e)
-		return []byte("Snapshot " + snapshotFilename + " has been saved in '" + e.snapshotsDir + "'!"), err
+		return []byte("Snapshot '" + snapshotFilename + "' has been saved!"), err
 	case Select:
-		// Честно, не понимаю, зачем нужен rtree для select'а всего: rtree полезен здесь для поиска геометрических объектов, находящихся в какой-либо области, но ладно
-		marshal, err := json.Marshal(e.features)
+		featureCollection := geojson.NewFeatureCollection()
+		e.featuresRTree.Scan(
+			func(_, _ [2]float64, data *geojson.Feature) bool {
+				featureCollection.Append(data)
+				return true
+			},
+		)
+
+		marshal, err := json.Marshal(featureCollection)
 		if err != nil {
 			return nil, err
 		}
