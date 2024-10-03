@@ -17,8 +17,6 @@ import (
 
 const SnapshotDateFormat = "02-Jan-2006-15_04_05"
 
-type Action int
-
 const (
 	Insert Action = iota
 	Replace
@@ -26,6 +24,8 @@ const (
 	Select
 	Snapshot
 )
+
+type Action int
 
 type Router struct {
 	// Поля
@@ -249,7 +249,7 @@ func initEngine(e *DBEngine) error {
 }
 
 func initEngineFiles(logFilename string, snapshotsDir string) error {
-	// Создадим директорию со снапшотами, если ее нет
+	// Создадим директорию со snapshot'ами, если ее нет
 	if err := os.Mkdir(snapshotsDir, 0755); err != nil && !os.IsExist(err) {
 		return err
 	}
@@ -268,7 +268,7 @@ func initEngineFiles(logFilename string, snapshotsDir string) error {
 	return nil
 }
 
-// Сохраняет snapshot и возвращает пару: (название snapshot'а, ошибка | nil)
+// Сохраняет snapshot, чистит журнал и возвращает пару: (название snapshot'а, ошибка | nil)
 func saveSnapshot(e *DBEngine) (string, error) {
 	snapshotFilename := e.snapshotsDir + "snapshot-" + time.Now().Format(SnapshotDateFormat) + ".ckp"
 	file, err := os.OpenFile(snapshotFilename, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
@@ -349,7 +349,6 @@ func runTransaction(e *DBEngine, transaction Transaction) ([]byte, error) {
 				return true
 			},
 		)
-
 		marshal, err := json.Marshal(featureCollection)
 		if err != nil {
 			return nil, err
