@@ -16,14 +16,15 @@ import (
 	"time"
 )
 
-type Action int
-
 const SnapshotDateFormat = "02-Jan-2006-15_04_05"
+
+type Action int
 
 const (
 	Insert Action = iota
 	Replace
 	Delete
+	Snapshot
 )
 
 type Router struct {
@@ -42,7 +43,8 @@ type Storage struct {
 type DBEngine struct {
 	features map[string]*geojson.Feature
 	rt       rtree.RTree
-	lsn      uint64 // TODO При инициализации 0 - подумвй про мьютекс здесь, в остальных частях все ок
+
+	lsnCounter uint64
 
 	snapshotsDir string
 	logFilename  string
@@ -68,6 +70,7 @@ func NewRouter(mux *http.ServeMux, nodes [][]string) *Router {
 			mux.Handle("/insert", http.RedirectHandler("/"+currentNode+"/insert", http.StatusTemporaryRedirect))
 			mux.Handle("/replace", http.RedirectHandler("/"+currentNode+"/replace", http.StatusTemporaryRedirect))
 			mux.Handle("/delete", http.RedirectHandler("/"+currentNode+"/delete", http.StatusTemporaryRedirect))
+			mux.Handle("/checkpoint", http.RedirectHandler("/"+currentNode+"/checkpoint", http.StatusTemporaryRedirect))
 		}
 	}
 
@@ -86,7 +89,7 @@ func writeError(w http.ResponseWriter, err error) {
 	w.WriteHeader(http.StatusInternalServerError)
 	_, err = w.Write([]byte(err.Error()))
 	if err != nil {
-		panic(err)
+		panic(err.Error())
 	}
 }
 
@@ -96,23 +99,64 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool)
 
 	mux.HandleFunc("/"+name+"/insert", func(w http.ResponseWriter, r *http.Request) {
 		slog.Info("INSERT QUERY")
+		handleDbQuery(w, r, storage, name, Insert)
+	})
 
-		var feature geojson.Feature
-		err := json.NewDecoder(r.Body).Decode(&feature)
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		storage.transactionCh <- Transaction{Name: name, Action: Insert, Feature: &feature}
+	mux.HandleFunc("/"+name+"/replace", func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("REPLACE QUERY")
+		handleDbQuery(w, r, storage, name, Replace)
+	})
+
+	mux.HandleFunc("/"+name+"/delete", func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("DELETE QUERY")
+		handleDbQuery(w, r, storage, name, Delete)
+	})
+
+	// GET запросы
+	mux.HandleFunc("/"+name+"/checkpoint", func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("SAVING SNAPSHOT...")
+
+		storage.transactionCh <- Transaction{Name: name, Action: Snapshot}
 		engineResp := <-storage.engineRespCh
+
 		if engineResp == nil {
+			_, err := fmt.Fprintf(w, "Checkpoint has been saved!")
+			if err != nil {
+				panic(err.Error())
+			}
 			w.WriteHeader(http.StatusOK)
 		} else {
 			writeError(w, engineResp)
 		}
 	})
 
+	// TODO: НЕ ЗАБУДЬ ЗАКРЫТЬ файлы!
+	// TODO: сделать (просят использовать rtree)
+	mux.HandleFunc("/"+name+"/select", func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("SELECT QUERY...")
+		//handleAction(w, r, storage, name, Snapshot)
+	})
+
 	return &storage
+}
+
+func handleDbQuery(w http.ResponseWriter, r *http.Request, storage Storage, name string, action Action) {
+	var feature geojson.Feature
+	err := json.NewDecoder(r.Body).Decode(&feature)
+
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+
+	storage.transactionCh <- Transaction{Name: name, Action: action, Feature: &feature}
+	engineResp := <-storage.engineRespCh
+
+	if engineResp == nil {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		writeError(w, engineResp)
+	}
 }
 
 func (s *Storage) Run() {
@@ -144,13 +188,14 @@ func runEngine(s *Storage) {
 		}
 
 		if err = saveSnapshot(&Engine); err != nil {
-			panic(err)
+			panic(err.Error())
 		}
 
 		logFd, err := os.OpenFile(Engine.logFilename, os.O_WRONLY|os.O_APPEND, 0666)
 		if err != nil {
 			panic(err.Error())
 		}
+		defer logFd.Close()
 
 		// Слушаем
 		for {
@@ -159,8 +204,14 @@ func runEngine(s *Storage) {
 				return
 
 			case tr := <-s.transactionCh:
-				runTransaction(&Engine, tr)
-				s.engineRespCh <- writeTransactionToLog(logFd, tr)
+				tr.Lsn = Engine.lsnCounter
+				err = runTransaction(&Engine, tr)
+				if err != nil {
+					s.engineRespCh <- err
+				} else {
+					s.engineRespCh <- writeTransactionToFile(logFd, tr)
+				}
+				Engine.lsnCounter++
 			}
 		}
 
@@ -172,16 +223,16 @@ func initEngine(e *DBEngine) error {
 		return err
 	}
 
-	snapshot, err := getLastSnapshot(e.snapshotsDir)
+	snapshot, err := getLastSnapshotFilename(e.snapshotsDir)
 	if err != nil {
 		return err
 	}
 
-	if err = readSnapshot(snapshot, e); err != nil && !os.IsNotExist(err) { // Пытаемся считать последний snapshot
+	if err = runTransactionsFromFile(e, e.snapshotsDir+snapshot); err != nil && !os.IsNotExist(err) { // Пытаемся считать последний snapshot
 		return err
 	}
 
-	err = runTransactionsFromLog(e)
+	err = runTransactionsFromFile(e, e.logFilename)
 	if err != nil {
 		return err
 	}
@@ -197,7 +248,7 @@ func initEngineFiles(logFilename string, snapshotsDir string) error {
 
 	// Создадим журнал, если его нет
 	if _, err := os.Stat(logFilename); err != nil {
-		if _, err := os.Create(logFilename); err != nil {
+		if _, err = os.Create(logFilename); err != nil {
 			return err
 		}
 	}
@@ -205,23 +256,24 @@ func initEngineFiles(logFilename string, snapshotsDir string) error {
 	return nil
 }
 
-// Сохраняет данные из e.features
 func saveSnapshot(e *DBEngine) error {
-	// Надеюсь, не обидишься, если я не буду в снапшоте хранить транзакции честно...
-	featureCollection := geojson.NewFeatureCollection()
-
-	for _, feature := range e.features {
-		featureCollection.Append(feature)
-	}
-	body, err := json.Marshal(featureCollection)
+	file, err := os.OpenFile(
+		e.snapshotsDir+"snapshot-"+time.Now().Format(SnapshotDateFormat)+".ckp",
+		os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666,
+	)
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 
-	if err = os.WriteFile(e.snapshotsDir+"snapshot-"+time.Now().Format(SnapshotDateFormat)+".ckp", body, 0644); err != nil {
-		return err
+	for _, feature := range e.features {
+		// Сохраняю типа транзакции
+		if err = writeTransactionToFile(file, Transaction{Action: Insert, Feature: feature}); err != nil {
+			return err
+		}
 	}
 
+	// Чистим журнал после создания snapshot'а
 	if err = cleanLog(e.logFilename); err != nil {
 		return err
 	}
@@ -229,28 +281,7 @@ func saveSnapshot(e *DBEngine) error {
 	return nil
 }
 
-// Читает snapshot в e.features
-func readSnapshot(snapshotFilename string, e *DBEngine) error {
-
-	body, err := os.ReadFile(e.snapshotsDir + snapshotFilename)
-	if err != nil {
-		return err
-	}
-
-	tmpFeatureCollection := geojson.NewFeatureCollection()
-	err = json.Unmarshal(body, tmpFeatureCollection)
-	if err != nil {
-		return err
-	}
-	for _, feature := range tmpFeatureCollection.Features {
-		// Делаю "недотранзакцию" во избежание копипаст
-		runTransaction(e, Transaction{Action: Insert, Feature: feature})
-	}
-	fmt.Println(e.features)
-	return nil
-}
-
-func getLastSnapshot(snapshotsDir string) (string, error) {
+func getLastSnapshotFilename(snapshotsDir string) (string, error) {
 	entries, err := os.ReadDir(snapshotsDir)
 	if err != nil {
 		return "", err
@@ -276,8 +307,25 @@ func cleanLog(filename string) error {
 	return os.Truncate(filename, 0)
 }
 
-func runTransactionsFromLog(e *DBEngine) error {
-	file, err := os.Open(e.logFilename)
+// TODO: сюда еще Rtree научиться бы поддерживать + select
+func runTransaction(e *DBEngine, transaction Transaction) error {
+	switch transaction.Action {
+	case Insert:
+		e.features[transaction.Feature.ID.(string)] = transaction.Feature
+	case Replace:
+		e.features[transaction.Feature.ID.(string)] = transaction.Feature
+	case Delete:
+		delete(e.features, transaction.Feature.ID.(string))
+	case Snapshot:
+		return saveSnapshot(e)
+	}
+	return nil
+}
+
+func runTransactionsFromFile(e *DBEngine, filename string) error {
+	file, err := os.Open(filename)
+	defer file.Close()
+
 	if err != nil {
 		return err
 	}
@@ -287,25 +335,16 @@ func runTransactionsFromLog(e *DBEngine) error {
 		if err = json.Unmarshal(scanner.Bytes(), &tmpTr); err != nil {
 			return err
 		}
-		runTransaction(e, tmpTr)
+
+		if err = runTransaction(e, tmpTr); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// TODO: сюда еще Rtree научиться бы поддерживать + select
-func runTransaction(e *DBEngine, transaction Transaction) {
-	switch transaction.Action {
-	case Insert:
-		e.features[transaction.Feature.ID.(string)] = transaction.Feature
-	case Replace:
-		e.features[transaction.Feature.ID.(string)] = transaction.Feature
-	case Delete:
-		delete(e.features, transaction.Feature.ID.(string))
-	}
-}
-
 // 1 transaction - 1 line
-func writeTransactionToLog(file *os.File, transaction Transaction) error {
+func writeTransactionToFile(file *os.File, transaction Transaction) error {
 	marshal, err := json.Marshal(transaction)
 	if err != nil {
 		return err
@@ -343,7 +382,7 @@ func main() {
 
 		err := server.Shutdown(ctx)
 		if err != nil {
-			panic(err)
+			panic(err.Error())
 		}
 	}()
 
