@@ -9,6 +9,7 @@ require (
 )
 
 require (
+	github.com/gorilla/websocket v1.5.3
 	github.com/tidwall/geoindex v1.7.0 // indirect
 	go.mongodb.org/mongo-driver v1.11.4 // indirect
 )

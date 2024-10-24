@@ -1,0 +1,4 @@
+{"lsn":0,"name":"test","action":3,"feature":null}
+{"lsn":1,"name":"test","action":0,"feature":{"id":"87f4efed-0cd0-4fa8-8dc4-34f75bbbdaac","type":"Feature","geometry":{"type":"Point","coordinates":[3369635.528936698,8360885.968377829]},"properties":null}}
+{"lsn":2,"name":"test","action":0,"feature":{"id":"99ed63e0-a81c-450d-ae57-71d692dad3d9","type":"Feature","geometry":{"type":"Point","coordinates":[3377788.0885863304,8360312.877348057]},"properties":null}}
+{"lsn":3,"name":"test","action":0,"feature":{"id":"fa12d470-3e70-47a2-a46d-bd82e8b76ed0","type":"Feature","geometry":{"type":"Point","coordinates":[3378735.551288081,8364280.427558816]},"properties":null}}
