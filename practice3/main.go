@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"slices"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -58,6 +57,9 @@ type Storage struct {
 
 	mtx sync.Mutex
 
+	transactionCh chan Transaction
+	ResponseCh    chan Message
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -68,11 +70,7 @@ type StorageEngine struct {
 	vclock           map[string]uint64 // {<Узел 1>: <LSN узла 1>, ..., <Узел N>: <LSN узла N>}
 	replicasRegistry map[string]*websocket.Conn
 
-	transactionCh chan Transaction
-	ResponseCh    chan Message
-
 	snapshotsDir string
-	logFilename  string
 }
 
 type Transaction struct {
@@ -84,6 +82,52 @@ type Transaction struct {
 }
 
 const snapshotsDirectory = "snapshots/"
+
+func (s *Storage) logFilename() string {
+	return s.name + ".wal"
+}
+
+func cleanFile(filename string) error {
+	return os.Truncate(filename, 0)
+}
+
+func (s *Storage) leaderCheck() error {
+	if !s.leader {
+		return errors.New("the provided storage is not a leader")
+	} else {
+		return nil
+	}
+}
+
+func writeError(w http.ResponseWriter, err error) {
+	w.WriteHeader(http.StatusInternalServerError)
+	_, err = w.Write([]byte(err.Error()))
+	if err != nil {
+		panic(err.Error())
+	}
+}
+
+func getLastFileFilenameInDir(dir string) (string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	var newestFile string
+	var newestTime int64 = 0
+
+	for _, snapshot := range entries {
+		fileInfo, err := os.Stat(dir + snapshot.Name())
+		if err != nil {
+			return "", err
+		}
+		currTime := fileInfo.ModTime().Unix()
+		if currTime > newestTime {
+			newestTime = currTime
+			newestFile = snapshot.Name()
+		}
+	}
+	return newestFile, nil
+}
 
 func NewRouter(mux *http.ServeMux, nodes [][]string) *Router {
 	result := Router{}
@@ -111,22 +155,13 @@ func (r *Router) Stop() {
 	slog.Info("Stopping router...")
 }
 
-func writeError(w http.ResponseWriter, err error) {
-	w.WriteHeader(http.StatusInternalServerError)
-	_, err = w.Write([]byte(err.Error()))
-	if err != nil {
-		panic(err.Error())
-	}
-}
-
 func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool) *Storage {
 	ctx, cancel := context.WithCancel(context.Background())
 	engine := StorageEngine{
-		0, make(map[string]uint64), make(map[string]*websocket.Conn),
-		make(chan Transaction), make(chan Message), snapshotsDirectory, name + ".wal"}
+		0, make(map[string]uint64), make(map[string]*websocket.Conn), snapshotsDirectory}
 
 	storage := Storage{name, leader, make([]string, 0), &engine,
-		make(map[string]*geojson.Feature), rtree.RTreeG[*geojson.Feature]{}, sync.Mutex{}, ctx, cancel}
+		make(map[string]*geojson.Feature), rtree.RTreeG[*geojson.Feature]{}, sync.Mutex{}, make(chan Transaction), make(chan Message), ctx, cancel}
 
 	storage.setupHandlers(mux)
 	return &storage
@@ -188,7 +223,7 @@ func (s *Storage) setupHandlers(mux *http.ServeMux) {
 				if err = json.Unmarshal(message, &tmpTr); err != nil {
 					panic(err.Error())
 				}
-				s.engine.transactionCh <- tmpTr
+				s.transactionCh <- tmpTr
 			}
 		})
 	}
@@ -203,8 +238,8 @@ func (s *Storage) handlePostRequest(w http.ResponseWriter, r *http.Request, acti
 		return
 	}
 
-	s.engine.transactionCh <- Transaction{Name: s.name, Action: action, Feature: &feature}
-	engineResp := <-s.engine.ResponseCh
+	s.transactionCh <- Transaction{Name: s.name, Action: action, Feature: &feature}
+	engineResp := <-s.ResponseCh
 
 	if engineResp.err == nil {
 		w.WriteHeader(http.StatusOK)
@@ -214,8 +249,8 @@ func (s *Storage) handlePostRequest(w http.ResponseWriter, r *http.Request, acti
 }
 
 func (s *Storage) handleGetRequest(w http.ResponseWriter, action Action) {
-	s.engine.transactionCh <- Transaction{Name: s.name, Action: action}
-	engineResp := <-s.engine.ResponseCh
+	s.transactionCh <- Transaction{Name: s.name, Action: action}
+	engineResp := <-s.ResponseCh
 	if engineResp.err == nil {
 		w.WriteHeader(http.StatusOK)
 		_, err := w.Write(engineResp.body)
@@ -227,49 +262,7 @@ func (s *Storage) handleGetRequest(w http.ResponseWriter, action Action) {
 	}
 }
 
-func (s *Storage) Stop() {
-	slog.Info("Stopping storage '" + s.name + "'...")
-
-	s.cancel()
-	// Проходимся по всем подключениям реплик в регистре и посылаем closeMessage
-	// С другой стороны, если реплика получит такое сообщение, то горутина завершится (см. handle /replication)
-	// После чего закрываем подключение
-	for _, conn := range s.engine.replicasRegistry {
-		conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		conn.Close()
-	}
-}
-
-/*
-Предлагаю после создания snapshot'а чистить журнал транзакций. Тогда, если во время запуска Engine в журнале будут
-какие-то данные, мы точно будем знать, что они были записаны после последнего snapshot'а
-
-Следовательно, предлагается добиться персистентности данных следующим образом: считаем snapshot,
-применим действия из журнала, очистим журнал, сделаем snapshot
-*/
-
-// Todo: под конец инита сделать чекпоинт defer'ом
-func (s *Storage) Run() {
-	slog.Info("Starting storage '" + s.name + "'...")
-
-	go func() {
-		if err := s.Init(); err != nil {
-			panic(err.Error())
-		}
-
-		// Слушаем
-		for {
-			select {
-			case <-s.ctx.Done():
-				return
-
-			case tr := <-s.engine.transactionCh:
-				s.handleTransaction(tr)
-			}
-		}
-	}()
-}
-
+// TODO: внимательнее с leader
 func (s *Storage) handleTransaction(tr Transaction) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -277,13 +270,13 @@ func (s *Storage) handleTransaction(tr Transaction) {
 	tr.Lsn = s.engine.lsnCounter
 	msg, err := s.runTransaction(tr, true)
 	if err != nil {
-		s.engine.ResponseCh <- Message{err: err}
+		s.ResponseCh <- Message{err: err}
 	} else {
-		logFd, err := os.OpenFile(s.engine.logFilename, os.O_WRONLY|os.O_APPEND, 0666)
+		logFd, err := os.OpenFile(s.logFilename(), os.O_WRONLY|os.O_APPEND, 0666)
 		if err != nil {
 			panic(err.Error())
 		}
-		s.engine.ResponseCh <- Message{err: logTransaction(logFd, tr, true), body: msg} // Запишем в лог и передадим респонс транзакции в канал одновременно
+		s.ResponseCh <- Message{err: logTransaction(logFd, tr, true), body: msg} // Запишем в лог и передадим респонс транзакции в канал одновременно
 		if err = logFd.Close(); err != nil {
 			panic(err.Error())
 		}
@@ -291,32 +284,14 @@ func (s *Storage) handleTransaction(tr Transaction) {
 	s.engine.lsnCounter++
 }
 
-// Передаем транзакцию репликам
-func (s *Storage) notifyReplicas(tr *Transaction) {
-	if err := s.leaderCheck(); err != nil {
-		panic(err.Error())
-	}
-	json, err := json.Marshal(tr)
-	if err != nil {
-		panic(err.Error())
-	}
-	for replica, conn := range s.engine.replicasRegistry {
-		err = conn.WriteMessage(websocket.TextMessage, json)
-		if err != nil {
-			log.Fatal("Can't send transaction to replica: '" + replica + "'.")
-			conn.Close()
-			delete(s.engine.replicasRegistry, replica)
-		}
-	}
-}
-
 // Инициализирует журнал логирования и папку со снапшотами, если таких нет; запускает транзакции с последнего снапшота
 func (s *Storage) Init() error {
-	if err := initEngineFiles(s.engine.logFilename, s.engine.snapshotsDir); err != nil {
+
+	if err := initFiles(s.logFilename(), s.engine.snapshotsDir); err != nil {
 		return err
 	}
 
-	snapshot, err := getLastSnapshotFilename(s.engine.snapshotsDir)
+	snapshot, err := getLastFileFilenameInDir(s.engine.snapshotsDir)
 	if err != nil {
 		return err
 	}
@@ -326,7 +301,7 @@ func (s *Storage) Init() error {
 		return err
 	}
 
-	err = s.runTransactionsFromFile(s.engine.logFilename)
+	err = s.runTransactionsFromFile(s.logFilename())
 	if err != nil {
 		return err
 	}
@@ -338,7 +313,7 @@ func (s *Storage) Init() error {
 	return nil
 }
 
-func initEngineFiles(logFilename string, snapshotsDir string) error {
+func initFiles(logFilename string, snapshotsDir string) error {
 	// Создадим директорию со snapshot'ами, если ее нет
 	if err := os.Mkdir(snapshotsDir, 0755); err != nil && !os.IsExist(err) {
 		return err
@@ -356,6 +331,43 @@ func initEngineFiles(logFilename string, snapshotsDir string) error {
 	}(file)
 
 	return nil
+}
+
+func (s *Storage) Run() {
+	slog.Info("Starting storage '" + s.name + "'...")
+
+	go func() {
+
+		if s.leader {
+			if err := s.Init(); err != nil {
+				panic(err.Error())
+			}
+		}
+
+		// Слушаем
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+
+			case tr := <-s.transactionCh:
+				s.handleTransaction(tr)
+			}
+		}
+	}()
+}
+
+func (s *Storage) Stop() {
+	slog.Info("Stopping storage '" + s.name + "'...")
+
+	s.cancel()
+	// Проходимся по всем подключениям реплик в регистре и посылаем closeMessage
+	// С другой стороны, если реплика получит такое сообщение, то горутина завершится (см. handle /replication)
+	// После чего закрываем подключение
+	for _, conn := range s.engine.replicasRegistry {
+		conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		conn.Close()
+	}
 }
 
 // Сохраняет snapshot, чистит журнал (если надо) и возвращает пару: (название snapshot'а, ошибка | nil)
@@ -380,7 +392,7 @@ func (s *Storage) saveSnapshot(cleanLogAfterSnapshotFlag bool) (string, error) {
 	}
 
 	if cleanLogAfterSnapshotFlag {
-		if err = cleanLog(s.engine.logFilename); err != nil {
+		if err = cleanFile(s.logFilename()); err != nil {
 			return "", err
 		}
 	}
@@ -404,40 +416,6 @@ func logTransaction(file *os.File, transaction Transaction, onlyPostTransaction 
 	return nil
 }
 
-func getLastSnapshotFilename(snapshotsDir string) (string, error) {
-	entries, err := os.ReadDir(snapshotsDir)
-	if err != nil {
-		return "", err
-	}
-	var newestFile string
-	var newestTime int64 = 0
-
-	for _, snapshot := range entries {
-		fileInfo, err := os.Stat(snapshotsDir + snapshot.Name())
-		if err != nil {
-			return "", err
-		}
-		currTime := fileInfo.ModTime().Unix()
-		if currTime > newestTime {
-			newestTime = currTime
-			newestFile = snapshot.Name()
-		}
-	}
-	return newestFile, nil
-}
-
-func cleanLog(filename string) error {
-	return os.Truncate(filename, 0)
-}
-
-func (s *Storage) leaderCheck() error {
-	if !s.leader {
-		return errors.New("the provided storage is not a leader")
-	} else {
-		return nil
-	}
-}
-
 // Выполняет транзакцию и уведомляет реплики, если это транзакция на изменение
 func (s *Storage) runTransaction(transaction Transaction, vclockDependent bool) ([]byte, error) {
 	// Если транзакция зависит от vclock (например, она не зависит от vclock, когда мы подгружаем транзакции из файла)
@@ -457,24 +435,28 @@ func (s *Storage) runTransaction(transaction Transaction, vclockDependent bool) 
 		if err := s.leaderCheck(); err != nil {
 			panic(err.Error())
 		}
+
 		s.featuresPrimInd[transaction.Feature.ID.(string)] = transaction.Feature
 		s.featuresRTree.Insert(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
+
 		s.notifyReplicas(&transaction)
 	case Replace:
 		if err := s.leaderCheck(); err != nil {
 			panic(err.Error())
 		}
-		s.featuresPrimInd[transaction.Feature.ID.(string)] = transaction.Feature
 
+		s.featuresPrimInd[transaction.Feature.ID.(string)] = transaction.Feature
 		s.featuresRTree.Replace(
 			transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, s.featuresPrimInd[transaction.Feature.ID.(string)],
 			transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature,
 		)
+
 		s.notifyReplicas(&transaction)
 	case Delete:
 		if err := s.leaderCheck(); err != nil {
 			panic(err.Error())
 		}
+
 		delete(s.featuresPrimInd, transaction.Feature.ID.(string))
 		s.featuresRTree.Delete(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
 
@@ -526,33 +508,45 @@ func (s *Storage) runTransactionsFromFile(filename string) error {
 	return nil
 }
 
-func (s *Storage) replicateState(conn *websocket.Conn) {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-	for _, feature := range s.featuresPrimInd {
-		transaction := Transaction{Action: Insert, Feature: feature}
-		json, err := json.Marshal(transaction)
-		if err != nil {
-			panic(err)
-		}
-		err = conn.WriteMessage(websocket.TextMessage, json)
-		if err != nil {
-			panic(err)
-		}
-	}
-}
-
 // TODO : Весь vclock зависит от этого, подумай
-func (s *Storage) addReplica(url string, name string) {
-	if !s.leader {
-		panic("Only leader can have replics")
+
+// Просто создает реплику, НО НЕ ЗАПУСКАЕТ.
+// TODO: пока просто leader == false у реплики, но надо добавить возможность и для мастера (типа если мастер, то энджин свой, куда из реплик первым делом попадет s)
+func (s *Storage) addReplica(url string, name string, mux *http.ServeMux) *Storage {
+	ctx, cancel := context.WithCancel(context.Background())
+	replica := Storage{name, false, make([]string, 0), s.engine, s.featuresPrimInd, s.featuresRTree,
+		sync.Mutex{}, make(chan Transaction), make(chan Message), ctx, cancel}
+	replica.setupHandlers(mux)
+
+	if err := s.leaderCheck(); err != nil {
+		panic(err.Error())
 	}
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(url, "http")+"/"+name+"/replication", nil)
+	conn, _, err := websocket.DefaultDialer.Dial("ws://"+url+"/replication", nil)
 	if err != nil {
 		panic(err)
 	}
 	s.engine.replicasRegistry[name] = conn
-	s.replicateState(conn)
+
+	return &replica
+}
+
+// Передаем транзакцию репликам
+func (s *Storage) notifyReplicas(tr *Transaction) {
+	if err := s.leaderCheck(); err != nil {
+		panic(err.Error())
+	}
+	json, err := json.Marshal(tr)
+	if err != nil {
+		panic(err.Error())
+	}
+	for replica, conn := range s.engine.replicasRegistry {
+		err = conn.WriteMessage(websocket.TextMessage, json)
+		if err != nil {
+			log.Fatal("Can't send transaction to replica: '" + replica + "'.")
+			conn.Close()
+			delete(s.engine.replicasRegistry, replica)
+		}
+	}
 }
 
 func signalHandler(server *http.Server) {
@@ -576,10 +570,10 @@ func main() {
 
 	mux := http.ServeMux{}
 
-	router := NewRouter(&mux, [][]string{{"test"}})
+	router := NewRouter(&mux, [][]string{{"master"}})
 	router.Run()
 
-	storage := NewStorage(&mux, "test", []string{}, true)
+	storage := NewStorage(&mux, "master", []string{}, true)
 	storage.Run()
 
 	server := http.Server{
@@ -590,7 +584,7 @@ func main() {
 	signalHandler(&server)
 
 	slog.Info("Listen http://" + server.Addr)
-	err := server.ListenAndServe() // http event loop
+	err := server.ListenAndServe()
 	if !errors.Is(err, http.ErrServerClosed) {
 		slog.Info("err", "err", err)
 	}
