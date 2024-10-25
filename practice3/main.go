@@ -5,10 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,6 +33,8 @@ const (
 	Snapshot
 )
 
+var PostTransactions = []Action{Insert, Delete, Insert}
+
 type Action int
 
 type Router struct {
@@ -43,25 +50,26 @@ type Storage struct {
 	name     string
 	leader   bool
 	replicas []string
-	mux      *http.ServeMux
+
+	engine *StorageEngine
 
 	featuresPrimInd map[string]*geojson.Feature
 	featuresRTree   rtree.RTreeG[*geojson.Feature]
+
+	mtx sync.Mutex
 
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
-type DBEngine struct {
+type StorageEngine struct {
 	lsnCounter uint64
 
 	vclock           map[string]uint64 // {<Узел 1>: <LSN узла 1>, ..., <Узел N>: <LSN узла N>}
 	replicasRegistry map[string]*websocket.Conn
 
-	storage *Storage
-
 	transactionCh chan Transaction
-	engineRespCh  chan Message
+	ResponseCh    chan Message
 
 	snapshotsDir string
 	logFilename  string
@@ -77,23 +85,20 @@ type Transaction struct {
 
 const snapshotsDirectory = "snapshots/"
 
-var upgrader = websocket.Upgrader{}
-
 func NewRouter(mux *http.ServeMux, nodes [][]string) *Router {
 	result := Router{}
 
 	mux.Handle("/", http.FileServer(http.Dir("../front/dist")))
 
-	for nodeRow := range nodes {
-		for node := range nodes[nodeRow] {
-			currentNode := nodes[nodeRow][node]
-			mux.Handle("/select", http.RedirectHandler("/"+currentNode+"/select", http.StatusTemporaryRedirect))
-			mux.Handle("/insert", http.RedirectHandler("/"+currentNode+"/insert", http.StatusTemporaryRedirect))
-			mux.Handle("/replace", http.RedirectHandler("/"+currentNode+"/replace", http.StatusTemporaryRedirect))
-			mux.Handle("/delete", http.RedirectHandler("/"+currentNode+"/delete", http.StatusTemporaryRedirect))
-			mux.Handle("/checkpoint", http.RedirectHandler("/"+currentNode+"/checkpoint", http.StatusTemporaryRedirect))
-		}
-	}
+	mux.HandleFunc("/select", func(w http.ResponseWriter, r *http.Request) {
+		// Редиректим на рандомный узел нашего единственного недо-шарда
+		http.Redirect(w, r, "/"+nodes[0][rand.Intn(len(nodes[0]))]+"/select", http.StatusTemporaryRedirect)
+	})
+
+	mux.Handle("/insert", http.RedirectHandler("/"+nodes[0][0]+"/insert", http.StatusTemporaryRedirect))
+	mux.Handle("/replace", http.RedirectHandler("/"+nodes[0][0]+"/replace", http.StatusTemporaryRedirect))
+	mux.Handle("/delete", http.RedirectHandler("/"+nodes[0][0]+"/delete", http.StatusTemporaryRedirect))
+	mux.Handle("/checkpoint", http.RedirectHandler("/"+nodes[0][0]+"/checkpoint", http.StatusTemporaryRedirect))
 
 	return &result
 }
@@ -116,11 +121,80 @@ func writeError(w http.ResponseWriter, err error) {
 
 func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool) *Storage {
 	ctx, cancel := context.WithCancel(context.Background())
-	storage := Storage{name, leader, make([]string, 0), mux, make(map[string]*geojson.Feature), rtree.RTreeG[*geojson.Feature]{}, ctx, cancel}
+	engine := StorageEngine{
+		0, make(map[string]uint64), make(map[string]*websocket.Conn),
+		make(chan Transaction), make(chan Message), snapshotsDirectory, name + ".wal"}
+
+	storage := Storage{name, leader, make([]string, 0), &engine,
+		make(map[string]*geojson.Feature), rtree.RTreeG[*geojson.Feature]{}, sync.Mutex{}, ctx, cancel}
+
+	storage.setupHandlers(mux)
 	return &storage
 }
 
-func (e *DBEngine) handlePostRequest(w http.ResponseWriter, r *http.Request, storage *Storage, name string, action Action) {
+func (s *Storage) setupHandlers(mux *http.ServeMux) {
+	mux.HandleFunc("/"+s.name+"/checkpoint", func(w http.ResponseWriter, _ *http.Request) {
+		slog.Info("SAVING SNAPSHOT...")
+		s.handleGetRequest(w, Snapshot)
+	})
+
+	// TODO: надо переделать под новое тз
+	mux.HandleFunc("/"+s.name+"/select", func(w http.ResponseWriter, _ *http.Request) {
+		slog.Info("SELECT QUERY...")
+		s.handleGetRequest(w, Select)
+	})
+
+	// Создавать новые транзакции может только `Storage` у которого `leader == true`.
+	if s.leader {
+		mux.HandleFunc("/"+s.name+"/insert", func(w http.ResponseWriter, r *http.Request) {
+			slog.Info("INSERT QUERY")
+			s.handlePostRequest(w, r, Insert)
+		})
+
+		mux.HandleFunc("/"+s.name+"/replace", func(w http.ResponseWriter, r *http.Request) {
+			slog.Info("REPLACE QUERY")
+			s.handlePostRequest(w, r, Replace)
+		})
+
+		mux.HandleFunc("/"+s.name+"/delete", func(w http.ResponseWriter, r *http.Request) {
+			slog.Info("DELETE QUERY")
+			s.handlePostRequest(w, r, Delete)
+		})
+	} else { // Ну иначе мы имеем дело с репликацией (предполагаем, что она уже подключена и находится в нашем регистре)
+		mux.HandleFunc("/"+s.name+"/replication", func(w http.ResponseWriter, r *http.Request) {
+			var upgrader = websocket.Upgrader{
+				ReadBufferSize:  1024,
+				WriteBufferSize: 1024,
+			}
+
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				panic(err.Error())
+			}
+			defer conn.Close()
+
+			// Слушаем
+			for {
+				// Читаем, что пришло от мастера
+				_, message, err := conn.ReadMessage()
+				if err != nil {
+					if err, status := err.(*websocket.CloseError); status && (err.Code == websocket.CloseNormalClosure) {
+						return
+					}
+					panic(err.Error())
+				}
+
+				var tmpTr Transaction
+				if err = json.Unmarshal(message, &tmpTr); err != nil {
+					panic(err.Error())
+				}
+				s.engine.transactionCh <- tmpTr
+			}
+		})
+	}
+}
+
+func (s *Storage) handlePostRequest(w http.ResponseWriter, r *http.Request, action Action) {
 	var feature geojson.Feature
 	err := json.NewDecoder(r.Body).Decode(&feature)
 
@@ -129,8 +203,8 @@ func (e *DBEngine) handlePostRequest(w http.ResponseWriter, r *http.Request, sto
 		return
 	}
 
-	e.transactionCh <- Transaction{Name: name, Action: action, Feature: &feature}
-	engineResp := <-e.engineRespCh
+	s.engine.transactionCh <- Transaction{Name: s.name, Action: action, Feature: &feature}
+	engineResp := <-s.engine.ResponseCh
 
 	if engineResp.err == nil {
 		w.WriteHeader(http.StatusOK)
@@ -139,9 +213,9 @@ func (e *DBEngine) handlePostRequest(w http.ResponseWriter, r *http.Request, sto
 	}
 }
 
-func (e *DBEngine) handleGetRequest(w http.ResponseWriter, storage *Storage, name string, action Action) {
-	e.transactionCh <- Transaction{Name: name, Action: action}
-	engineResp := <-e.engineRespCh
+func (s *Storage) handleGetRequest(w http.ResponseWriter, action Action) {
+	s.engine.transactionCh <- Transaction{Name: s.name, Action: action}
+	engineResp := <-s.engine.ResponseCh
 	if engineResp.err == nil {
 		w.WriteHeader(http.StatusOK)
 		_, err := w.Write(engineResp.body)
@@ -153,123 +227,111 @@ func (e *DBEngine) handleGetRequest(w http.ResponseWriter, storage *Storage, nam
 	}
 }
 
-func (s *Storage) Run() {
-	slog.Info("Starting storage '" + s.name + "'...")
-
-	engine := DBEngine{
-		0, make(map[string]uint64), make(map[string]*websocket.Conn), s,
-		make(chan Transaction), make(chan Message), snapshotsDirectory, s.name + ".ldf"}
-	engine.Run()
-}
-
 func (s *Storage) Stop() {
 	slog.Info("Stopping storage '" + s.name + "'...")
+
 	s.cancel()
+	// Проходимся по всем подключениям реплик в регистре и посылаем closeMessage
+	// С другой стороны, если реплика получит такое сообщение, то горутина завершится (см. handle /replication)
+	// После чего закрываем подключение
+	for _, conn := range s.engine.replicasRegistry {
+		conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		conn.Close()
+	}
 }
 
 /*
 Предлагаю после создания snapshot'а чистить журнал транзакций. Тогда, если во время запуска Engine в журнале будут
 какие-то данные, мы точно будем знать, что они были записаны после последнего snapshot'а
 
-Следовательно, предлагается добиться персистентности данных следующим образом: считаем snapshot в переменную features,
-последовательно применим действия из журнала к features, очистим журнал, сделаем snapshot
+Следовательно, предлагается добиться персистентности данных следующим образом: считаем snapshot,
+применим действия из журнала, очистим журнал, сделаем snapshot
 */
 
-// TODO: возможно нужен будет чек стореджа на мастера
-func (e *DBEngine) Run() {
+// Todo: под конец инита сделать чекпоинт defer'ом
+func (s *Storage) Run() {
+	slog.Info("Starting storage '" + s.name + "'...")
+
 	go func() {
-
-		err := e.Init()
-		if err != nil {
+		if err := s.Init(); err != nil {
 			panic(err.Error())
 		}
-
-		if _, err = e.saveSnapshot(); err != nil {
-			panic(err.Error())
-		}
-
-		e.setupHandlers()
-		// e.connectToReplicas()
 
 		// Слушаем
 		for {
 			select {
-			case <-e.storage.ctx.Done():
+			case <-s.ctx.Done():
 				return
 
-			case tr := <-e.transactionCh:
-				tr.Lsn = e.lsnCounter
-				msg, err := e.runTransaction(tr)
-				if err != nil {
-					e.engineRespCh <- Message{err: err}
-				} else {
-					logFd, err := os.OpenFile(e.logFilename, os.O_WRONLY|os.O_APPEND, 0666)
-					if err != nil {
-						panic(err.Error())
-					}
-					e.engineRespCh <- Message{err: writeTransactionToFile(logFd, tr), body: msg}
-					if err = logFd.Close(); err != nil {
-						panic(err.Error())
-					}
-				}
-				e.lsnCounter++
+			case tr := <-s.engine.transactionCh:
+				s.handleTransaction(tr)
 			}
 		}
-
 	}()
 }
 
-func (e *DBEngine) setupHandlers() {
-	// POST запросы
-	e.storage.mux.HandleFunc("/"+e.storage.name+"/insert", func(w http.ResponseWriter, r *http.Request) {
-		slog.Info("INSERT QUERY")
-		e.handlePostRequest(w, r, e.storage, e.storage.name, Insert)
-	})
+func (s *Storage) handleTransaction(tr Transaction) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
 
-	e.storage.mux.HandleFunc("/"+e.storage.name+"/replace", func(w http.ResponseWriter, r *http.Request) {
-		slog.Info("REPLACE QUERY")
-		e.handlePostRequest(w, r, e.storage, e.storage.name, Replace)
-	})
-
-	e.storage.mux.HandleFunc("/"+e.storage.name+"/delete", func(w http.ResponseWriter, r *http.Request) {
-		slog.Info("DELETE QUERY")
-		e.handlePostRequest(w, r, e.storage, e.storage.name, Delete)
-	})
-
-	// GET запросы
-	e.storage.mux.HandleFunc("/"+e.storage.name+"/checkpoint", func(w http.ResponseWriter, _ *http.Request) {
-		slog.Info("SAVING SNAPSHOT...")
-		e.handleGetRequest(w, e.storage, e.storage.name, Snapshot)
-	})
-
-	// TODO: надо переделать под новое тз
-	e.storage.mux.HandleFunc("/"+e.storage.name+"/select", func(w http.ResponseWriter, _ *http.Request) {
-		slog.Info("SELECT QUERY...")
-		e.handleGetRequest(w, e.storage, e.storage.name, Select)
-	})
+	tr.Lsn = s.engine.lsnCounter
+	msg, err := s.runTransaction(tr, true)
+	if err != nil {
+		s.engine.ResponseCh <- Message{err: err}
+	} else {
+		logFd, err := os.OpenFile(s.engine.logFilename, os.O_WRONLY|os.O_APPEND, 0666)
+		if err != nil {
+			panic(err.Error())
+		}
+		s.engine.ResponseCh <- Message{err: logTransaction(logFd, tr, true), body: msg} // Запишем в лог и передадим респонс транзакции в канал одновременно
+		if err = logFd.Close(); err != nil {
+			panic(err.Error())
+		}
+	}
+	s.engine.lsnCounter++
 }
 
-func (e *DBEngine) connectToReplicas() {
-
+// Передаем транзакцию репликам
+func (s *Storage) notifyReplicas(tr *Transaction) {
+	if err := s.leaderCheck(); err != nil {
+		panic(err.Error())
+	}
+	json, err := json.Marshal(tr)
+	if err != nil {
+		panic(err.Error())
+	}
+	for replica, conn := range s.engine.replicasRegistry {
+		err = conn.WriteMessage(websocket.TextMessage, json)
+		if err != nil {
+			log.Fatal("Can't send transaction to replica: '" + replica + "'.")
+			conn.Close()
+			delete(s.engine.replicasRegistry, replica)
+		}
+	}
 }
 
-func (e *DBEngine) Init() error {
-	if err := initEngineFiles(e.logFilename, e.snapshotsDir); err != nil {
+// Инициализирует журнал логирования и папку со снапшотами, если таких нет; запускает транзакции с последнего снапшота
+func (s *Storage) Init() error {
+	if err := initEngineFiles(s.engine.logFilename, s.engine.snapshotsDir); err != nil {
 		return err
 	}
 
-	snapshot, err := getLastSnapshotFilename(e.snapshotsDir)
+	snapshot, err := getLastSnapshotFilename(s.engine.snapshotsDir)
 	if err != nil {
 		return err
 	}
 
 	// Пытаемся считать последний snapshot
-	if err = e.runTransactionsFromFile(e.snapshotsDir + snapshot); err != nil && !os.IsNotExist(err) {
+	if err = s.runTransactionsFromFile(s.engine.snapshotsDir + snapshot); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 
-	err = e.runTransactionsFromFile(e.logFilename)
+	err = s.runTransactionsFromFile(s.engine.logFilename)
 	if err != nil {
+		return err
+	}
+
+	if _, err := s.saveSnapshot(true); err != nil {
 		return err
 	}
 
@@ -296,9 +358,9 @@ func initEngineFiles(logFilename string, snapshotsDir string) error {
 	return nil
 }
 
-// Сохраняет snapshot, чистит журнал и возвращает пару: (название snapshot'а, ошибка | nil)
-func (e *DBEngine) saveSnapshot() (string, error) {
-	snapshotFilename := e.snapshotsDir + "snapshot-" + time.Now().Format(SnapshotDateFormat) + ".ckp"
+// Сохраняет snapshot, чистит журнал (если надо) и возвращает пару: (название snapshot'а, ошибка | nil)
+func (s *Storage) saveSnapshot(cleanLogAfterSnapshotFlag bool) (string, error) {
+	snapshotFilename := s.engine.snapshotsDir + "snapshot-" + time.Now().Format(SnapshotDateFormat) + ".ckp"
 	file, err := os.OpenFile(snapshotFilename, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
 	if err != nil {
 		return "", err
@@ -310,19 +372,36 @@ func (e *DBEngine) saveSnapshot() (string, error) {
 		}
 	}(file)
 
-	for _, feature := range e.storage.featuresPrimInd {
+	for _, feature := range s.featuresPrimInd {
 		// Сохраняю типа транзакции
-		if err = writeTransactionToFile(file, Transaction{Action: Insert, Feature: feature}); err != nil {
+		if err = logTransaction(file, Transaction{Action: Insert, Feature: feature}, true); err != nil {
 			return "", err
 		}
 	}
 
-	// Чистим журнал после создания snapshot'а
-	if err = cleanLog(e.logFilename); err != nil {
-		return "", err
+	if cleanLogAfterSnapshotFlag {
+		if err = cleanLog(s.engine.logFilename); err != nil {
+			return "", err
+		}
 	}
 
 	return snapshotFilename, nil
+}
+
+// 1 transaction - 1 line
+func logTransaction(file *os.File, transaction Transaction, onlyPostTransaction bool) error {
+	if onlyPostTransaction && !slices.Contains(PostTransactions, transaction.Action) {
+		return nil // Если выставлен флаг onlyPostTransaction, а сама транзакция - не post, то просто выйдем
+	}
+	marshal, err := json.Marshal(transaction)
+	if err != nil {
+		return err
+	}
+	_, err = file.WriteString(string(marshal) + "\n")
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func getLastSnapshotFilename(snapshotsDir string) (string, error) {
@@ -351,27 +430,61 @@ func cleanLog(filename string) error {
 	return os.Truncate(filename, 0)
 }
 
-func (e *DBEngine) runTransaction(transaction Transaction) ([]byte, error) {
+func (s *Storage) leaderCheck() error {
+	if !s.leader {
+		return errors.New("the provided storage is not a leader")
+	} else {
+		return nil
+	}
+}
+
+// Выполняет транзакцию и уведомляет реплики, если это транзакция на изменение
+func (s *Storage) runTransaction(transaction Transaction, vclockDependent bool) ([]byte, error) {
+	// Если транзакция зависит от vclock (например, она не зависит от vclock, когда мы подгружаем транзакции из файла)
+	if vclockDependent {
+		// Проверяем, применяли ли мы уже эту транзакцию
+		lastLSN, exists := s.engine.vclock[transaction.Name]
+		if exists && transaction.Lsn <= lastLSN {
+			return nil, nil // Уже применили эту или более новую транзакцию от этого узла, но по факту это же не ошибка
+		}
+		// Обновляем vclock
+		s.engine.vclock[transaction.Name] = transaction.Lsn
+		// ----
+	}
+
 	switch transaction.Action {
 	case Insert:
-		e.storage.featuresPrimInd[transaction.Feature.ID.(string)] = transaction.Feature
-		e.storage.featuresRTree.Insert(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
+		if err := s.leaderCheck(); err != nil {
+			panic(err.Error())
+		}
+		s.featuresPrimInd[transaction.Feature.ID.(string)] = transaction.Feature
+		s.featuresRTree.Insert(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
+		s.notifyReplicas(&transaction)
 	case Replace:
-		e.storage.featuresPrimInd[transaction.Feature.ID.(string)] = transaction.Feature
+		if err := s.leaderCheck(); err != nil {
+			panic(err.Error())
+		}
+		s.featuresPrimInd[transaction.Feature.ID.(string)] = transaction.Feature
 
-		e.storage.featuresRTree.Replace(
-			transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, e.storage.featuresPrimInd[transaction.Feature.ID.(string)],
+		s.featuresRTree.Replace(
+			transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, s.featuresPrimInd[transaction.Feature.ID.(string)],
 			transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature,
 		)
+		s.notifyReplicas(&transaction)
 	case Delete:
-		delete(e.storage.featuresPrimInd, transaction.Feature.ID.(string))
-		e.storage.featuresRTree.Delete(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
+		if err := s.leaderCheck(); err != nil {
+			panic(err.Error())
+		}
+		delete(s.featuresPrimInd, transaction.Feature.ID.(string))
+		s.featuresRTree.Delete(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
+
+		s.notifyReplicas(&transaction)
 	case Snapshot:
-		snapshotFilename, err := e.saveSnapshot()
+		snapshotFilename, err := s.saveSnapshot(true)
 		return []byte("Snapshot '" + snapshotFilename + "' has been saved!"), err
 	case Select:
 		featureCollection := geojson.NewFeatureCollection()
-		e.storage.featuresRTree.Scan(
+		s.featuresRTree.Scan(
 			func(_, _ [2]float64, data *geojson.Feature) bool {
 				featureCollection.Append(data)
 				return true
@@ -388,7 +501,7 @@ func (e *DBEngine) runTransaction(transaction Transaction) ([]byte, error) {
 	return nil, nil
 }
 
-func (e *DBEngine) runTransactionsFromFile(filename string) error {
+func (s *Storage) runTransactionsFromFile(filename string) error {
 	file, err := os.Open(filename)
 	defer func(file *os.File) {
 		if err = file.Close(); err != nil {
@@ -406,24 +519,57 @@ func (e *DBEngine) runTransactionsFromFile(filename string) error {
 			return err
 		}
 
-		if _, err = e.runTransaction(tmpTr); err != nil {
+		if _, err = s.runTransaction(tmpTr, false); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// 1 transaction - 1 line
-func writeTransactionToFile(file *os.File, transaction Transaction) error {
-	marshal, err := json.Marshal(transaction)
-	if err != nil {
-		return err
+func (s *Storage) replicateState(conn *websocket.Conn) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	for _, feature := range s.featuresPrimInd {
+		transaction := Transaction{Action: Insert, Feature: feature}
+		json, err := json.Marshal(transaction)
+		if err != nil {
+			panic(err)
+		}
+		err = conn.WriteMessage(websocket.TextMessage, json)
+		if err != nil {
+			panic(err)
+		}
 	}
-	_, err = file.WriteString(string(marshal) + "\n")
-	if err != nil {
-		return err
+}
+
+// TODO : Весь vclock зависит от этого, подумай
+func (s *Storage) addReplica(url string, name string) {
+	if !s.leader {
+		panic("Only leader can have replics")
 	}
-	return nil
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(url, "http")+"/"+name+"/replication", nil)
+	if err != nil {
+		panic(err)
+	}
+	s.engine.replicasRegistry[name] = conn
+	s.replicateState(conn)
+}
+
+func signalHandler(server *http.Server) {
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		sig := <-sigChan
+		slog.Info("Got signal:", sig)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		err := server.Shutdown(ctx)
+		if err != nil {
+			panic(err.Error())
+		}
+	}()
 }
 
 func main() {
@@ -441,22 +587,7 @@ func main() {
 		Handler: &mux,
 	}
 
-	go func() {
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-		sig := <-sigChan
-		slog.Info("Got signal:", sig)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		err := server.Shutdown(ctx)
-		if err != nil {
-			panic(err.Error())
-		}
-	}()
-
-	defer slog.Info("Shutting down...")
+	signalHandler(&server)
 
 	slog.Info("Listen http://" + server.Addr)
 	err := server.ListenAndServe() // http event loop
@@ -466,4 +597,6 @@ func main() {
 
 	router.Stop()
 	storage.Stop()
+
+	defer slog.Info("Shutting down...")
 }
