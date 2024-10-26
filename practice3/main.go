@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
-	"log/slog"
 	"math/rand"
 	"net/http"
 	"os"
@@ -65,9 +64,6 @@ type Storage struct {
 	featuresPrimInd map[string]*geojson.Feature
 	featuresRTree   rtree.RTreeG[*geojson.Feature]
 
-	transactionCh chan Transaction
-	ResponseCh    chan Message
-
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -76,6 +72,9 @@ type StorageEngine struct {
 	lsnCounter uint64
 
 	replicasRegistry map[string]*websocket.Conn
+
+	transactionCh chan Transaction
+	ResponseCh    chan Message
 
 	snapshotsDir string
 }
@@ -165,20 +164,19 @@ func NewRouter(mux *http.ServeMux, nodes [][]string) *Router {
 }
 
 func (r *Router) Run() {
-	slog.Info("Starting router...")
+	log.Print("Starting router...")
 }
 
 func (r *Router) Stop() {
-	slog.Info("Stopping router...")
+	log.Print("Stopping router...")
 }
 
 func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool) *Storage {
 	ctx, cancel := context.WithCancel(context.Background())
-	engine := StorageEngine{1, make(map[string]*websocket.Conn), snapshotsDirectory}
 
-	storage := Storage{name, leader, replicas, &engine, make(map[string]*geojson.Feature), rtree.RTreeG[*geojson.Feature]{},
-		make(chan Transaction), make(chan Message), ctx, cancel}
+	engine := StorageEngine{1, make(map[string]*websocket.Conn), make(chan Transaction), make(chan Message), snapshotsDirectory}
 
+	storage := Storage{name, leader, replicas, &engine, make(map[string]*geojson.Feature), rtree.RTreeG[*geojson.Feature]{}, ctx, cancel}
 	storage.setupHandlers(mux)
 	return &storage
 }
@@ -187,29 +185,29 @@ func (s *Storage) setupHandlers(mux *http.ServeMux) {
 
 	// TODO: надо переделать под новое тз
 	mux.HandleFunc("/"+s.name+"/select", func(w http.ResponseWriter, _ *http.Request) {
-		slog.Info("SELECT QUERY...")
+		log.Print("SELECT QUERY...")
 		s.handleGetRequest(w, Select)
 	})
 
 	mux.HandleFunc("/"+s.name+"/snapshot", func(w http.ResponseWriter, _ *http.Request) {
-		slog.Info("SAVING SNAPSHOT...")
+		log.Print("SAVING SNAPSHOT...")
 		s.handleGetRequest(w, Snapshot)
 	})
 
 	// Создавать новые транзакции может только `Storage` у которого `leader == true`.
 	if s.leader {
 		mux.HandleFunc("/"+s.name+"/insert", func(w http.ResponseWriter, r *http.Request) {
-			slog.Info("INSERT QUERY")
+			log.Print("INSERT QUERY")
 			s.handlePostRequest(w, r, Insert)
 		})
 
 		mux.HandleFunc("/"+s.name+"/replace", func(w http.ResponseWriter, r *http.Request) {
-			slog.Info("REPLACE QUERY")
+			log.Print("REPLACE QUERY")
 			s.handlePostRequest(w, r, Replace)
 		})
 
 		mux.HandleFunc("/"+s.name+"/delete", func(w http.ResponseWriter, r *http.Request) {
-			slog.Info("DELETE QUERY")
+			log.Print("DELETE QUERY")
 			s.handlePostRequest(w, r, Delete)
 		})
 	} else { // Ну иначе мы имеем дело с репликацией (предполагаем, что она уже подключена и находится в нашем регистре)
@@ -226,15 +224,8 @@ func (s *Storage) setupHandlers(mux *http.ServeMux) {
 				_, message, err := conn.ReadMessage()
 
 				if err != nil {
-					// Если пришло сообщение на завершение, и текущее хранилище - реплика, то завершаемся. Иначе если мастер, то можем спокойно продолжать работу
+					// Если пришло сообщение на завершение, и текущее хранилище - реплика, то завершаемся
 					if err, status := err.(*websocket.CloseError); status && (err.Code == websocket.CloseNormalClosure) {
-						/* if s.leader {
-							// TODO: опять надо подумать, что делать, если реплика - мастер
-							// Если запрос на завершение пришел, значит тот адрес завершил свое существование
-							// Предлагается удалять из регистра адрес, с которого пришел запрос
-
-							//continue
-						} */
 						return
 					}
 					panic(err.Error())
@@ -245,8 +236,8 @@ func (s *Storage) setupHandlers(mux *http.ServeMux) {
 					panic(err.Error())
 				}
 
-				s.transactionCh <- tmpTr
-				<-s.ResponseCh
+				s.engine.transactionCh <- tmpTr
+				<-s.engine.ResponseCh
 			}
 		})
 	}
@@ -261,8 +252,8 @@ func (s *Storage) handlePostRequest(w http.ResponseWriter, r *http.Request, acti
 		return
 	}
 
-	s.transactionCh <- Transaction{Lsn: s.engine.lsnCounter, Name: s.name, Action: action, Feature: &feature}
-	engineResp := <-s.ResponseCh
+	s.engine.transactionCh <- Transaction{Lsn: s.engine.lsnCounter, Name: s.name, Action: action, Feature: &feature}
+	engineResp := <-s.engine.ResponseCh
 
 	if engineResp.err == nil {
 		w.WriteHeader(http.StatusOK)
@@ -272,8 +263,8 @@ func (s *Storage) handlePostRequest(w http.ResponseWriter, r *http.Request, acti
 }
 
 func (s *Storage) handleGetRequest(w http.ResponseWriter, action Action) {
-	s.transactionCh <- Transaction{Name: s.name, Action: action}
-	engineResp := <-s.ResponseCh
+	s.engine.transactionCh <- Transaction{Name: s.name, Action: action}
+	engineResp := <-s.engine.ResponseCh
 	if engineResp.err == nil {
 		w.WriteHeader(http.StatusOK)
 		_, err := w.Write(engineResp.body)
@@ -289,17 +280,15 @@ func (s *Storage) handleTransaction(tr Transaction) {
 	// Если это нефиктивная (lsn != 0) пост-транзакция + она была раньше (lsn меньше), то пропускаем ее
 	VClock.mtx.Lock()
 	if slices.Contains(PostTransactions, tr.Action) && tr.Lsn <= VClock.vclock[s.name] && tr.Lsn > 0 {
-		s.ResponseCh <- Message{}
+		s.engine.ResponseCh <- Message{}
 		VClock.mtx.Unlock()
 		return
 	}
 	VClock.mtx.Unlock()
 
-	// log.Print(s.name, " ", tr.Name, " ", tr.Lsn, VClock.vclock[s.name])
-
 	msg, err := s.runTransaction(tr)
 	if err != nil {
-		s.ResponseCh <- Message{err: err}
+		s.engine.ResponseCh <- Message{err: err}
 	} else {
 		if s.leader {
 			logFd, err := os.OpenFile(s.logFilename(), os.O_WRONLY|os.O_APPEND, 0666)
@@ -323,7 +312,7 @@ func (s *Storage) handleTransaction(tr Transaction) {
 			s.engine.lsnCounter++
 		}
 
-		s.ResponseCh <- Message{err: err, body: msg}
+		s.engine.ResponseCh <- Message{err: err, body: msg}
 	}
 }
 
@@ -384,7 +373,7 @@ func initFiles(logFilename string, snapshotsDir string) error {
 }
 
 func (s *Storage) Run() {
-	slog.Info("Starting storage '" + s.name + "'...")
+	log.Printf("Starting storage '%s'...", s.name)
 
 	go func() {
 
@@ -401,7 +390,7 @@ func (s *Storage) Run() {
 			case <-s.ctx.Done():
 				return
 
-			case tr := <-s.transactionCh:
+			case tr := <-s.engine.transactionCh:
 				s.handleTransaction(tr)
 			}
 		}
@@ -409,7 +398,7 @@ func (s *Storage) Run() {
 }
 
 func (s *Storage) Stop() {
-	slog.Info("Stopping storage '" + s.name + "'...")
+	log.Printf("Stopping storage '%s'...", s.name)
 
 	s.cancel()
 	// Проходимся по всем подключениям реплик в регистре и посылаем closeMessage
@@ -437,7 +426,7 @@ func (s *Storage) saveSnapshot() (string, error) {
 
 	for _, feature := range s.featuresPrimInd {
 		// Сохраняю типа транзакции
-		if err = logTransaction(file, Transaction{Lsn: 0, Name: s.name, Action: Insert, Feature: feature}, true); err != nil {
+		if err = logTransaction(file, Transaction{Name: s.name, Action: Insert, Feature: feature}, true); err != nil {
 			return "", err
 		}
 	}
@@ -530,7 +519,7 @@ func (s *Storage) runTransactionsFromFile(filename string) error {
 			return err
 		}
 
-		tmpTr.Lsn = 0
+		tmpTr.Lsn = 0 // Они не будут идти в счет журнала => они фиктивные
 		if _, err = s.runTransaction(tmpTr); err != nil {
 			return err
 		}
@@ -546,7 +535,7 @@ func (s *Storage) connectToReplicas() {
 		// Установить соединение с репликой по WebSocket
 		conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8080/"+replica+"/replication", nil)
 		if err != nil {
-			log.Printf("Ошибка подключения к реплике %s: %v", replica, err)
+			log.Printf("Can't connect to replica '%s': %v", replica, err)
 			return
 		}
 		s.engine.replicasRegistry[replica] = conn
@@ -566,7 +555,7 @@ func (s *Storage) notifyReplicas(tr *Transaction) {
 	for replica, conn := range s.engine.replicasRegistry {
 		err = conn.WriteMessage(websocket.TextMessage, json)
 		if err != nil {
-			log.Fatal("Can't send transaction to replica: '" + replica + "'.")
+			log.Printf("Can't send transaction to replica: '%s': %v", replica, err)
 			conn.Close()
 			delete(s.engine.replicasRegistry, replica)
 		}
@@ -578,7 +567,7 @@ func signalHandler(server *http.Server) {
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 		sig := <-sigChan
-		slog.Info("Got signal:", sig)
+		log.Printf("Got signal: %s", sig)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -603,11 +592,12 @@ func (v *VectorClock) Init(nodes [][]string) {
 
 func main() {
 	mux := http.ServeMux{}
-	nodes := [][]string{{"master", "slave"}}
+	nodes := [][]string{{"master", "slave1", "slave2"}}
 
 	router := NewRouter(&mux, nodes)
-	m := NewStorage(&mux, "master", []string{"slave"}, true)
-	s := NewStorage(&mux, "slave", make([]string, 0), false)
+	m := NewStorage(&mux, nodes[0][0], []string{nodes[0][1], nodes[0][2]}, true)
+	s1 := NewStorage(&mux, nodes[0][1], []string{nodes[0][0], nodes[0][2]}, false)
+	s2 := NewStorage(&mux, nodes[0][2], []string{nodes[0][0], nodes[0][1]}, false)
 
 	VClock.Init(nodes)
 
@@ -616,8 +606,10 @@ func main() {
 
 	m.Run()
 	defer m.Stop()
-	s.Run()
-	defer s.Stop()
+	s1.Run()
+	defer s1.Stop()
+	s2.Run()
+	defer s2.Stop()
 
 	server := http.Server{
 		Addr:    "127.0.0.1:8080",
@@ -625,11 +617,11 @@ func main() {
 	}
 	signalHandler(&server)
 
-	slog.Info("Listen http://" + server.Addr)
+	log.Printf("Listen http://%s", server.Addr)
 	err := server.ListenAndServe()
 	if !errors.Is(err, http.ErrServerClosed) {
-		slog.Info("err", "err", err)
+		log.Printf("err", "err", err)
 	}
 
-	defer slog.Info("Shutting down...")
+	defer log.Print("Shutting down...")
 }
