@@ -150,7 +150,7 @@ func NewRouter(mux *http.ServeMux, nodes [][]string) *Router {
 	mux.Handle("/insert", http.RedirectHandler("/"+nodes[0][0]+"/insert", http.StatusTemporaryRedirect))
 	mux.Handle("/replace", http.RedirectHandler("/"+nodes[0][0]+"/replace", http.StatusTemporaryRedirect))
 	mux.Handle("/delete", http.RedirectHandler("/"+nodes[0][0]+"/delete", http.StatusTemporaryRedirect))
-	mux.Handle("/checkpoint", http.RedirectHandler("/"+nodes[0][0]+"/checkpoint", http.StatusTemporaryRedirect))
+	mux.Handle("/snapshot", http.RedirectHandler("/"+nodes[0][0]+"/snapshot", http.StatusTemporaryRedirect))
 
 	return &result
 }
@@ -176,10 +176,6 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool)
 }
 
 func (s *Storage) setupHandlers(mux *http.ServeMux) {
-	mux.HandleFunc("/"+s.name+"/checkpoint", func(w http.ResponseWriter, _ *http.Request) {
-		slog.Info("SAVING SNAPSHOT...")
-		s.handleGetRequest(w, Snapshot)
-	})
 
 	// TODO: надо переделать под новое тз
 	mux.HandleFunc("/"+s.name+"/select", func(w http.ResponseWriter, _ *http.Request) {
@@ -202,6 +198,11 @@ func (s *Storage) setupHandlers(mux *http.ServeMux) {
 		mux.HandleFunc("/"+s.name+"/delete", func(w http.ResponseWriter, r *http.Request) {
 			slog.Info("DELETE QUERY")
 			s.handlePostRequest(w, r, Delete)
+		})
+
+		mux.HandleFunc("/"+s.name+"/snapshot", func(w http.ResponseWriter, _ *http.Request) {
+			slog.Info("SAVING SNAPSHOT...")
+			s.handleGetRequest(w, Snapshot)
 		})
 	} else { // Ну иначе мы имеем дело с репликацией (предполагаем, что она уже подключена и находится в нашем регистре)
 		mux.HandleFunc("/"+s.name+"/replication", func(w http.ResponseWriter, r *http.Request) {
@@ -284,7 +285,7 @@ func (s *Storage) handleTransaction(tr Transaction) {
 	defer s.mtx.Unlock()
 
 	tr.Lsn = s.engine.lsnCounter
-	msg, err := s.runTransaction(tr, false)
+	msg, err := s.runTransaction(tr)
 
 	if err != nil {
 		s.ResponseCh <- Message{err: err}
@@ -363,10 +364,10 @@ func (s *Storage) Run() {
 	go func() {
 
 		if s.leader {
+			s.connectToReplicas()
 			if err := s.Init(); err != nil {
 				panic(err.Error())
 			}
-			s.connectToReplicas()
 		}
 
 		// Слушаем
@@ -376,7 +377,6 @@ func (s *Storage) Run() {
 				return
 
 			case tr := <-s.transactionCh:
-				log.Print(s.name)
 				s.handleTransaction(tr)
 			}
 		}
@@ -396,6 +396,8 @@ func (s *Storage) Stop() {
 	} */
 }
 
+// TODO: везде с мьютексами по хорошему разобраться надо
+
 // Сохраняет snapshot, чистит журнал (если надо) и возвращает пару: (название snapshot'а, ошибка | nil)
 func (s *Storage) saveSnapshot(cleanLogAfterSnapshotFlag bool) (string, error) {
 	snapshotFilename := s.engine.snapshotsDir + "snapshot-" + time.Now().Format(SnapshotDateFormat) + ".ckp"
@@ -410,11 +412,13 @@ func (s *Storage) saveSnapshot(cleanLogAfterSnapshotFlag bool) (string, error) {
 		}
 	}(file)
 
+	var pseudoLsn uint64 = 0 // Чтобы хоть как-то нумеровать наши транзакции
 	for _, feature := range s.featuresPrimInd {
 		// Сохраняю типа транзакции
-		if err = logTransaction(file, Transaction{Action: Insert, Feature: feature}, true); err != nil {
+		if err = logTransaction(file, Transaction{Lsn: pseudoLsn, Name: s.name, Action: Insert, Feature: feature}, true); err != nil {
 			return "", err
 		}
+		pseudoLsn++
 	}
 
 	if cleanLogAfterSnapshotFlag {
@@ -443,10 +447,10 @@ func logTransaction(file *os.File, transaction Transaction, onlyPostTransaction 
 }
 
 // Выполняет транзакцию и уведомляет реплики, если это транзакция на изменение
-func (s *Storage) runTransaction(transaction Transaction, vclockDependent bool) ([]byte, error) {
-	// Если транзакция зависит от vclock (например, она не зависит от vclock, когда мы подгружаем транзакции из файла)
-	if vclockDependent {
-		// Проверяем, применяли ли мы уже эту транзакцию
+func (s *Storage) runTransaction(transaction Transaction) ([]byte, error) {
+	// Проверяем, применяли ли мы уже эту транзакцию
+	// TODO
+	/* if slices.Contains(PostTransactions, transaction.Action) {
 		lastLSN, exists := s.engine.vclock[transaction.Name]
 		if exists && transaction.Lsn <= lastLSN {
 			return nil, nil // Уже применили эту или более новую транзакцию от этого узла, но по факту это же не ошибка
@@ -454,7 +458,7 @@ func (s *Storage) runTransaction(transaction Transaction, vclockDependent bool) 
 		// Обновляем vclock
 		s.engine.vclock[transaction.Name] = transaction.Lsn
 		// ----
-	}
+	} */
 
 	switch transaction.Action {
 	case Insert:
@@ -521,7 +525,7 @@ func (s *Storage) runTransactionsFromFile(filename string) error {
 			return err
 		}
 
-		if _, err = s.runTransaction(tmpTr, false); err != nil {
+		if _, err = s.runTransaction(tmpTr); err != nil {
 			return err
 		}
 	}
@@ -533,15 +537,13 @@ func (s *Storage) connectToReplicas() {
 		return
 	}
 	for _, replica := range s.replicas {
-		go func(replica string) {
-			// Установить соединение с репликой по WebSocket
-			conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8080/"+replica+"/replication", nil)
-			if err != nil {
-				log.Printf("Ошибка подключения к реплике %s: %v", replica, err)
-				return
-			}
-			s.engine.replicasRegistry[replica] = conn
-		}(replica)
+		// Установить соединение с репликой по WebSocket
+		conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8080/"+replica+"/replication", nil)
+		if err != nil {
+			log.Printf("Ошибка подключения к реплике %s: %v", replica, err)
+			return
+		}
+		s.engine.replicasRegistry[replica] = conn
 	}
 }
 
@@ -556,6 +558,8 @@ func (s *Storage) notifyReplicas(tr *Transaction) {
 	}
 
 	for replica, conn := range s.engine.replicasRegistry {
+
+		slog.Info("yo")
 		err = conn.WriteMessage(websocket.TextMessage, json)
 		if err != nil {
 			log.Fatal("Can't send transaction to replica: '" + replica + "'.")
@@ -586,7 +590,7 @@ func main() {
 
 	mux := http.ServeMux{}
 
-	router := NewRouter(&mux, [][]string{{"master", "slave1"}})
+	router := NewRouter(&mux, [][]string{{"master", "slave"}})
 	m := NewStorage(&mux, "master", []string{"slave"}, true)
 	s := NewStorage(&mux, "slave", make([]string, 0), false)
 
@@ -596,10 +600,10 @@ func main() {
 	}
 	router.Run()
 	defer router.Stop()
-	s.Run()
-	defer s.Stop()
 	m.Run()
 	defer m.Stop()
+	s.Run()
+	defer s.Stop()
 
 	signalHandler(&server)
 
