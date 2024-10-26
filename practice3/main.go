@@ -65,8 +65,6 @@ type Storage struct {
 	featuresPrimInd map[string]*geojson.Feature
 	featuresRTree   rtree.RTreeG[*geojson.Feature]
 
-	mtx sync.Mutex
-
 	transactionCh chan Transaction
 	ResponseCh    chan Message
 
@@ -176,11 +174,10 @@ func (r *Router) Stop() {
 
 func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool) *Storage {
 	ctx, cancel := context.WithCancel(context.Background())
-	engine := StorageEngine{
-		0, make(map[string]*websocket.Conn), snapshotsDirectory}
+	engine := StorageEngine{1, make(map[string]*websocket.Conn), snapshotsDirectory}
 
-	storage := Storage{name, leader, replicas, &engine,
-		make(map[string]*geojson.Feature), rtree.RTreeG[*geojson.Feature]{}, sync.Mutex{}, make(chan Transaction), make(chan Message), ctx, cancel}
+	storage := Storage{name, leader, replicas, &engine, make(map[string]*geojson.Feature), rtree.RTreeG[*geojson.Feature]{},
+		make(chan Transaction), make(chan Message), ctx, cancel}
 
 	storage.setupHandlers(mux)
 	return &storage
@@ -264,7 +261,7 @@ func (s *Storage) handlePostRequest(w http.ResponseWriter, r *http.Request, acti
 		return
 	}
 
-	s.transactionCh <- Transaction{Name: s.name, Action: action, Feature: &feature}
+	s.transactionCh <- Transaction{Lsn: s.engine.lsnCounter, Name: s.name, Action: action, Feature: &feature}
 	engineResp := <-s.ResponseCh
 
 	if engineResp.err == nil {
@@ -289,9 +286,18 @@ func (s *Storage) handleGetRequest(w http.ResponseWriter, action Action) {
 }
 
 func (s *Storage) handleTransaction(tr Transaction) {
-	tr.Lsn = s.engine.lsnCounter
-	msg, err := s.runTransaction(tr)
+	// Если это нефиктивная (lsn != 0) пост-транзакция + она была раньше (lsn меньше), то пропускаем ее
+	VClock.mtx.Lock()
+	if slices.Contains(PostTransactions, tr.Action) && tr.Lsn <= VClock.vclock[s.name] && tr.Lsn > 0 {
+		s.ResponseCh <- Message{}
+		VClock.mtx.Unlock()
+		return
+	}
+	VClock.mtx.Unlock()
 
+	// log.Print(s.name, " ", tr.Name, " ", tr.Lsn, VClock.vclock[s.name])
+
+	msg, err := s.runTransaction(tr)
 	if err != nil {
 		s.ResponseCh <- Message{err: err}
 	} else {
@@ -308,12 +314,13 @@ func (s *Storage) handleTransaction(tr Transaction) {
 			}
 		}
 
-		if slices.Contains(PostTransactions, tr.Action) {
-			s.engine.lsnCounter++ // Т.к. считаем только post-транзакции, а на slave'е их не может быть
-
+		// Если у нас прошла post-транзакция, и причем эта транзакция нефиктивная (lsn != 0), то учтем ее в vclock'е
+		if slices.Contains(PostTransactions, tr.Action) && tr.Lsn > 0 {
 			VClock.mtx.Lock()
 			VClock.vclock[s.name] = s.engine.lsnCounter
 			VClock.mtx.Unlock()
+
+			s.engine.lsnCounter++
 		}
 
 		s.ResponseCh <- Message{err: err, body: msg}
@@ -428,13 +435,11 @@ func (s *Storage) saveSnapshot() (string, error) {
 		}
 	}(file)
 
-	var pseudoLsn uint64 = 1 // Чтобы хоть как-то нумеровать наши транзакции
 	for _, feature := range s.featuresPrimInd {
 		// Сохраняю типа транзакции
-		if err = logTransaction(file, Transaction{Lsn: pseudoLsn, Name: s.name, Action: Insert, Feature: feature}, true); err != nil {
+		if err = logTransaction(file, Transaction{Lsn: 0, Name: s.name, Action: Insert, Feature: feature}, true); err != nil {
 			return "", err
 		}
-		pseudoLsn++
 	}
 
 	return snapshotFilename, nil
@@ -525,6 +530,7 @@ func (s *Storage) runTransactionsFromFile(filename string) error {
 			return err
 		}
 
+		tmpTr.Lsn = 0
 		if _, err = s.runTransaction(tmpTr); err != nil {
 			return err
 		}
