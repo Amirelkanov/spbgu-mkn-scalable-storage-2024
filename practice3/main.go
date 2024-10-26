@@ -45,6 +45,16 @@ type Message struct {
 	body []byte
 }
 
+type VectorClock struct {
+	vclock map[string]uint64 // {<Узел 1>: <LSN узла 1>, ..., <Узел N>: <LSN узла N>}
+	mtx    sync.Mutex
+}
+
+var VClock = VectorClock{
+	vclock: make(map[string]uint64),
+	mtx:    sync.Mutex{},
+}
+
 type Storage struct {
 	name     string
 	leader   bool
@@ -67,7 +77,6 @@ type Storage struct {
 type StorageEngine struct {
 	lsnCounter uint64
 
-	vclock           map[string]uint64 // {<Узел 1>: <LSN узла 1>, ..., <Узел N>: <LSN узла N>}
 	replicasRegistry map[string]*websocket.Conn
 
 	snapshotsDir string
@@ -168,7 +177,7 @@ func (r *Router) Stop() {
 func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool) *Storage {
 	ctx, cancel := context.WithCancel(context.Background())
 	engine := StorageEngine{
-		0, make(map[string]uint64), make(map[string]*websocket.Conn), snapshotsDirectory}
+		0, make(map[string]*websocket.Conn), snapshotsDirectory}
 
 	storage := Storage{name, leader, replicas, &engine,
 		make(map[string]*geojson.Feature), rtree.RTreeG[*geojson.Feature]{}, sync.Mutex{}, make(chan Transaction), make(chan Message), ctx, cancel}
@@ -280,10 +289,6 @@ func (s *Storage) handleGetRequest(w http.ResponseWriter, action Action) {
 }
 
 func (s *Storage) handleTransaction(tr Transaction) {
-
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-
 	tr.Lsn = s.engine.lsnCounter
 	msg, err := s.runTransaction(tr)
 
@@ -301,10 +306,16 @@ func (s *Storage) handleTransaction(tr Transaction) {
 			if err = logFd.Close(); err != nil {
 				panic(err.Error())
 			}
-			if slices.Contains(PostTransactions, tr.Action) {
-				s.engine.lsnCounter++ // Т.к. считаем только post-транзакции, а на slave'е их не может быть
-			}
 		}
+
+		if slices.Contains(PostTransactions, tr.Action) {
+			s.engine.lsnCounter++ // Т.к. считаем только post-транзакции, а на slave'е их не может быть
+
+			VClock.mtx.Lock()
+			VClock.vclock[s.name] = s.engine.lsnCounter
+			VClock.mtx.Unlock()
+		}
+
 		s.ResponseCh <- Message{err: err, body: msg}
 	}
 }
@@ -397,13 +408,11 @@ func (s *Storage) Stop() {
 	// Проходимся по всем подключениям реплик в регистре и посылаем closeMessage
 	// С другой стороны, если реплика получит такое сообщение, то горутина завершится (см. handle /replication)
 	// После чего закрываем подключение
-	/* for _, conn := range s.engine.replicasRegistry {
+	for _, conn := range s.engine.replicasRegistry {
 		conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 		conn.Close()
-	} */
+	}
 }
-
-// TODO: везде с мьютексами по хорошему разобраться надо
 
 // Сохраняет snapshot, чистит журнал (если надо) и возвращает пару: (название snapshot'а, ошибка | nil)
 func (s *Storage) saveSnapshot() (string, error) {
@@ -419,7 +428,7 @@ func (s *Storage) saveSnapshot() (string, error) {
 		}
 	}(file)
 
-	var pseudoLsn uint64 = 0 // Чтобы хоть как-то нумеровать наши транзакции
+	var pseudoLsn uint64 = 1 // Чтобы хоть как-то нумеровать наши транзакции
 	for _, feature := range s.featuresPrimInd {
 		// Сохраняю типа транзакции
 		if err = logTransaction(file, Transaction{Lsn: pseudoLsn, Name: s.name, Action: Insert, Feature: feature}, true); err != nil {
@@ -449,17 +458,6 @@ func logTransaction(file *os.File, transaction Transaction, onlyPostTransaction 
 
 // Выполняет транзакцию и уведомляет реплики, если это транзакция на изменение
 func (s *Storage) runTransaction(transaction Transaction) ([]byte, error) {
-	// Проверяем, применяли ли мы уже эту транзакцию
-	// TODO
-	/* if slices.Contains(PostTransactions, transaction.Action) {
-		lastLSN, exists := s.engine.vclock[transaction.Name]
-		if exists && transaction.Lsn <= lastLSN {
-			return nil, nil // Уже применили эту или более новую транзакцию от этого узла, но по факту это же не ошибка
-		}
-		// Обновляем vclock
-		s.engine.vclock[transaction.Name] = transaction.Lsn
-		// ----
-	} */
 
 	switch transaction.Action {
 	case Insert:
@@ -560,8 +558,6 @@ func (s *Storage) notifyReplicas(tr *Transaction) {
 	}
 
 	for replica, conn := range s.engine.replicasRegistry {
-
-		slog.Info("yo")
 		err = conn.WriteMessage(websocket.TextMessage, json)
 		if err != nil {
 			log.Fatal("Can't send transaction to replica: '" + replica + "'.")
@@ -588,25 +584,39 @@ func signalHandler(server *http.Server) {
 	}()
 }
 
+func (v *VectorClock) Init(nodes [][]string) {
+	v.mtx.Lock()
+	defer v.mtx.Unlock()
+
+	for _, nodeRow := range nodes {
+		for _, node := range nodeRow {
+			v.vclock[node] = 0
+		}
+	}
+}
+
 func main() {
-
 	mux := http.ServeMux{}
+	nodes := [][]string{{"master", "slave"}}
 
-	router := NewRouter(&mux, [][]string{{"master", "slave"}})
+	router := NewRouter(&mux, nodes)
 	m := NewStorage(&mux, "master", []string{"slave"}, true)
 	s := NewStorage(&mux, "slave", make([]string, 0), false)
 
-	server := http.Server{
-		Addr:    "127.0.0.1:8080",
-		Handler: &mux,
-	}
+	VClock.Init(nodes)
+
 	router.Run()
 	defer router.Stop()
+
 	m.Run()
 	defer m.Stop()
 	s.Run()
 	defer s.Stop()
 
+	server := http.Server{
+		Addr:    "127.0.0.1:8080",
+		Handler: &mux,
+	}
 	signalHandler(&server)
 
 	slog.Info("Listen http://" + server.Addr)
