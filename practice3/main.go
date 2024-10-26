@@ -85,10 +85,12 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Отключить проверку происхождения для тестирования
+		return true
 	},
 }
 
+// Все снапшоты сгребаю в одну папку для простоты и загружаю последний сохраненный снапшот так же для простоты.
+// Можно, конечно, для каждой реплики делать свою директорию, но давай оставим так
 const snapshotsDirectory = "snapshots/"
 
 func (s *Storage) logFilename() string {
@@ -183,6 +185,11 @@ func (s *Storage) setupHandlers(mux *http.ServeMux) {
 		s.handleGetRequest(w, Select)
 	})
 
+	mux.HandleFunc("/"+s.name+"/snapshot", func(w http.ResponseWriter, _ *http.Request) {
+		slog.Info("SAVING SNAPSHOT...")
+		s.handleGetRequest(w, Snapshot)
+	})
+
 	// Создавать новые транзакции может только `Storage` у которого `leader == true`.
 	if s.leader {
 		mux.HandleFunc("/"+s.name+"/insert", func(w http.ResponseWriter, r *http.Request) {
@@ -198,11 +205,6 @@ func (s *Storage) setupHandlers(mux *http.ServeMux) {
 		mux.HandleFunc("/"+s.name+"/delete", func(w http.ResponseWriter, r *http.Request) {
 			slog.Info("DELETE QUERY")
 			s.handlePostRequest(w, r, Delete)
-		})
-
-		mux.HandleFunc("/"+s.name+"/snapshot", func(w http.ResponseWriter, _ *http.Request) {
-			slog.Info("SAVING SNAPSHOT...")
-			s.handleGetRequest(w, Snapshot)
 		})
 	} else { // Ну иначе мы имеем дело с репликацией (предполагаем, что она уже подключена и находится в нашем регистре)
 		mux.HandleFunc("/"+s.name+"/replication", func(w http.ResponseWriter, r *http.Request) {
@@ -277,8 +279,6 @@ func (s *Storage) handleGetRequest(w http.ResponseWriter, action Action) {
 	}
 }
 
-// TODO: внимательнее с leader
-
 func (s *Storage) handleTransaction(tr Transaction) {
 
 	s.mtx.Lock()
@@ -311,6 +311,9 @@ func (s *Storage) handleTransaction(tr Transaction) {
 
 // Инициализирует журнал логирования и папку со снапшотами, если таких нет; запускает транзакции с последнего снапшота
 func (s *Storage) Init() error {
+	if err := s.leaderCheck(); err != nil {
+		return err
+	}
 
 	if err := initFiles(s.logFilename(), s.engine.snapshotsDir); err != nil {
 		return err
@@ -331,7 +334,11 @@ func (s *Storage) Init() error {
 		return err
 	}
 
-	if _, err := s.saveSnapshot(true); err != nil {
+	if _, err := s.saveSnapshot(); err != nil {
+		return err
+	}
+
+	if err = cleanFile(s.logFilename()); err != nil {
 		return err
 	}
 
@@ -399,7 +406,7 @@ func (s *Storage) Stop() {
 // TODO: везде с мьютексами по хорошему разобраться надо
 
 // Сохраняет snapshot, чистит журнал (если надо) и возвращает пару: (название snapshot'а, ошибка | nil)
-func (s *Storage) saveSnapshot(cleanLogAfterSnapshotFlag bool) (string, error) {
+func (s *Storage) saveSnapshot() (string, error) {
 	snapshotFilename := s.engine.snapshotsDir + "snapshot-" + time.Now().Format(SnapshotDateFormat) + ".ckp"
 	file, err := os.OpenFile(snapshotFilename, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
 	if err != nil {
@@ -419,12 +426,6 @@ func (s *Storage) saveSnapshot(cleanLogAfterSnapshotFlag bool) (string, error) {
 			return "", err
 		}
 		pseudoLsn++
-	}
-
-	if cleanLogAfterSnapshotFlag {
-		if err = cleanFile(s.logFilename()); err != nil {
-			return "", err
-		}
 	}
 
 	return snapshotFilename, nil
@@ -486,8 +487,9 @@ func (s *Storage) runTransaction(transaction Transaction) ([]byte, error) {
 			s.notifyReplicas(&transaction)
 		}
 	case Snapshot:
-		snapshotFilename, err := s.saveSnapshot(true)
+		snapshotFilename, err := s.saveSnapshot()
 		return []byte("Snapshot '" + snapshotFilename + "' has been saved!"), err
+
 	case Select:
 		featureCollection := geojson.NewFeatureCollection()
 		s.featuresRTree.Scan(
