@@ -32,11 +32,12 @@ const (
 )
 
 var PostTransactions = []Action{Insert, Delete, Insert}
+var port = ":8080"
 
 type Action int
 
 type Router struct {
-	// Поля
+	numOfSelectQueries uint64
 }
 
 type Message struct {
@@ -146,13 +147,21 @@ func getLastFileFilenameInDir(dir string) (string, error) {
 }
 
 func NewRouter(mux *http.ServeMux, nodes [][]string) *Router {
-	result := Router{}
+	router := Router{numOfSelectQueries: 0}
+	var url string
 
 	mux.Handle("/", http.FileServer(http.Dir("../front/dist")))
 
 	mux.HandleFunc("/select", func(w http.ResponseWriter, r *http.Request) {
-		// Редиректим на рандомный узел нашего единственного недо-шарда
-		http.Redirect(w, r, "/"+nodes[0][rand.Intn(len(nodes[0]))]+"/select", http.StatusTemporaryRedirect)
+		router.numOfSelectQueries++
+		if router.numOfSelectQueries == 3 {
+			// Тут выбор из схемы: 1 мастер - остальные реплики
+			url = "/" + nodes[0][1+rand.Intn(len(nodes[0])-1)] + "/select"
+			router.numOfSelectQueries = 0
+		} else {
+			url = "/" + nodes[0][0] + "/select"
+		}
+		http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 	})
 
 	mux.Handle("/insert", http.RedirectHandler("/"+nodes[0][0]+"/insert", http.StatusTemporaryRedirect))
@@ -160,7 +169,7 @@ func NewRouter(mux *http.ServeMux, nodes [][]string) *Router {
 	mux.Handle("/delete", http.RedirectHandler("/"+nodes[0][0]+"/delete", http.StatusTemporaryRedirect))
 	mux.Handle("/snapshot", http.RedirectHandler("/"+nodes[0][0]+"/snapshot", http.StatusTemporaryRedirect))
 
-	return &result
+	return &router
 }
 
 func (r *Router) Run() {
@@ -182,8 +191,6 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool)
 }
 
 func (s *Storage) setupHandlers(mux *http.ServeMux) {
-
-	// TODO: надо переделать под новое тз
 	mux.HandleFunc("/"+s.name+"/select", func(w http.ResponseWriter, _ *http.Request) {
 		log.Print("SELECT QUERY...")
 		s.handleGetRequest(w, Select)
@@ -533,7 +540,7 @@ func (s *Storage) connectToReplicas() {
 	}
 	for _, replica := range s.replicas {
 		// Установить соединение с репликой по WebSocket
-		conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8080/"+replica+"/replication", nil)
+		conn, _, err := websocket.DefaultDialer.Dial("ws://localhost"+port+"/"+replica+"/replication", nil)
 		if err != nil {
 			log.Printf("Can't connect to replica '%s': %v", replica, err)
 			return
@@ -596,8 +603,8 @@ func main() {
 
 	router := NewRouter(&mux, nodes)
 	m := NewStorage(&mux, nodes[0][0], []string{nodes[0][1], nodes[0][2]}, true)
-	s1 := NewStorage(&mux, nodes[0][1], []string{nodes[0][0], nodes[0][2]}, false)
-	s2 := NewStorage(&mux, nodes[0][2], []string{nodes[0][0], nodes[0][1]}, false)
+	s1 := NewStorage(&mux, nodes[0][1], make([]string, 0), false)
+	s2 := NewStorage(&mux, nodes[0][2], make([]string, 0), false)
 
 	VClock.Init(nodes)
 
@@ -612,7 +619,7 @@ func main() {
 	defer s2.Stop()
 
 	server := http.Server{
-		Addr:    "127.0.0.1:8080",
+		Addr:    "localhost" + port,
 		Handler: &mux,
 	}
 	signalHandler(&server)
