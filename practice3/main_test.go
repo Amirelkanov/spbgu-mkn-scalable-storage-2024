@@ -56,7 +56,6 @@ func getTest(t *testing.T, mux *http.ServeMux, url string) {
 		}
 		rr := httptest.NewRecorder()
 		mux.ServeHTTP(rr, req)
-
 		if rr.Code != http.StatusOK {
 			t.Errorf("handler returned wrong status code: got %v want %v", rr.Code, http.StatusOK)
 		}
@@ -84,7 +83,7 @@ func deleteTest(t *testing.T, mux *http.ServeMux, storage *Storage) {
 }
 
 func checkpointTest(t *testing.T, mux *http.ServeMux, storage *Storage) {
-	getTest(t, mux, "/"+storage.name+"/checkpoint")
+	getTest(t, mux, "/"+storage.name+"/snapshot")
 }
 
 func selectTest(t *testing.T, mux *http.ServeMux, storage *Storage) {
@@ -105,11 +104,11 @@ func TestComplex(t *testing.T) {
 	mux := http.NewServeMux()
 
 	s := NewStorage(mux, "test", []string{}, true)
-	snapshotsDir, logFilename := "testSnapshots/", s.name+"_test.ldf"
+	snapshotsDir, logFilename := "testSnapshots/", s.name+".wal"
 
 	go func() { s.Run() }()
 
-	r := NewRouter(mux, [][]string{{"test"}})
+	r := NewRouter(mux, [][]string{{"test"}}, 3)
 	go func() { r.Run() }()
 
 	t.Cleanup(r.Stop)

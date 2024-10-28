@@ -37,7 +37,7 @@ var port = ":8080"
 type Action int
 
 type Router struct {
-	numOfSelectQueries uint64
+	maxNumOfSelectQueries uint64
 }
 
 type Message struct {
@@ -78,6 +78,7 @@ type StorageEngine struct {
 	ResponseCh    chan Message
 
 	snapshotsDir string
+	logFilename  string
 }
 
 type Transaction struct {
@@ -99,10 +100,6 @@ var upgrader = websocket.Upgrader{
 // Все снапшоты сгребаю в одну папку для простоты и загружаю последний сохраненный снапшот так же для простоты.
 // Можно, конечно, для каждой реплики делать свою директорию, но давай оставим так
 const snapshotsDirectory = "snapshots/"
-
-func (s *Storage) logFilename() string {
-	return s.name + ".wal"
-}
 
 func cleanFile(filename string) error {
 	return os.Truncate(filename, 0)
@@ -146,18 +143,20 @@ func getLastFileFilenameInDir(dir string) (string, error) {
 	return newestFile, nil
 }
 
-func NewRouter(mux *http.ServeMux, nodes [][]string) *Router {
-	router := Router{numOfSelectQueries: 0}
+func NewRouter(mux *http.ServeMux, nodes [][]string, maxNumOfSelectQueries uint64) *Router {
+	router := Router{maxNumOfSelectQueries: maxNumOfSelectQueries}
+
+	var numOfSelectQueries uint64 = 0
 	var url string
 
 	mux.Handle("/", http.FileServer(http.Dir("../front/dist")))
 
 	mux.HandleFunc("/select", func(w http.ResponseWriter, r *http.Request) {
-		router.numOfSelectQueries++
-		if router.numOfSelectQueries == 3 {
+		numOfSelectQueries++
+		if numOfSelectQueries == router.maxNumOfSelectQueries {
 			// Тут выбор из схемы: 1 мастер - остальные реплики
 			url = "/" + nodes[0][1+rand.Intn(len(nodes[0])-1)] + "/select"
-			router.numOfSelectQueries = 0
+			numOfSelectQueries = 0
 		} else {
 			url = "/" + nodes[0][0] + "/select"
 		}
@@ -174,16 +173,18 @@ func NewRouter(mux *http.ServeMux, nodes [][]string) *Router {
 
 func (r *Router) Run() {
 	log.Print("Starting router...")
+	log.Print("Router has been started")
 }
 
 func (r *Router) Stop() {
 	log.Print("Stopping router...")
+	log.Print("Router has been stopped")
 }
 
 func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool) *Storage {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	engine := StorageEngine{1, make(map[string]*websocket.Conn), make(chan Transaction), make(chan Message), snapshotsDirectory}
+	engine := StorageEngine{1, make(map[string]*websocket.Conn), make(chan Transaction), make(chan Message), snapshotsDirectory, name + ".wal"}
 
 	storage := Storage{name, leader, replicas, &engine, make(map[string]*geojson.Feature), rtree.RTreeG[*geojson.Feature]{}, ctx, cancel}
 	storage.setupHandlers(mux)
@@ -217,12 +218,12 @@ func (s *Storage) setupHandlers(mux *http.ServeMux) {
 			log.Print("DELETE QUERY")
 			s.handlePostRequest(w, r, Delete)
 		})
-	} else { // Ну иначе мы имеем дело с репликацией (предполагаем, что она уже подключена и находится в нашем регистре)
+	} else { // Иначе мы имеем дело с репликацией (предполагаем, что она уже подключена и находится в нашем регистре)
 		mux.HandleFunc("/"+s.name+"/replication", func(w http.ResponseWriter, r *http.Request) {
 
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
-				panic(err.Error()) // Ну давайте вот это я паникой сделаю, так логичнее
+				panic(err.Error()) // Вот это я паникой сделаю, так логичнее
 			}
 			defer conn.Close()
 
@@ -234,7 +235,7 @@ func (s *Storage) setupHandlers(mux *http.ServeMux) {
 					// Если пришло сообщение на завершение, и текущее хранилище - реплика, то завершаемся
 					if err, status := err.(*websocket.CloseError); status && (err.Code == websocket.CloseNormalClosure) {
 						s.Stop()
-						conn.WriteMessage(websocket.CloseNormalClosure, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Replica closed."))
+						conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 						return
 					}
 					writeError(w, err)
@@ -306,7 +307,7 @@ func (s *Storage) handleTransaction(tr Transaction) {
 		s.engine.ResponseCh <- Message{Err: err}
 	} else {
 		if s.leader {
-			logFd, err := os.OpenFile(s.logFilename(), os.O_WRONLY|os.O_APPEND, 0666)
+			logFd, err := os.OpenFile(s.engine.logFilename, os.O_WRONLY|os.O_APPEND, 0666)
 			if err != nil {
 				panic(err.Error())
 			}
@@ -337,7 +338,7 @@ func (s *Storage) Init() error {
 		return err
 	}
 
-	if err := initFiles(s.logFilename(), s.engine.snapshotsDir); err != nil {
+	if err := initFiles(s.engine.logFilename, s.engine.snapshotsDir); err != nil {
 		return err
 	}
 
@@ -351,7 +352,7 @@ func (s *Storage) Init() error {
 		return err
 	}
 
-	err = s.runTransactionsFromFile(s.logFilename())
+	err = s.runTransactionsFromFile(s.engine.logFilename)
 	if err != nil {
 		return err
 	}
@@ -360,7 +361,7 @@ func (s *Storage) Init() error {
 		return err
 	}
 
-	if err = cleanFile(s.logFilename()); err != nil {
+	if err = cleanFile(s.engine.logFilename); err != nil {
 		return err
 	}
 
@@ -400,6 +401,7 @@ func (s *Storage) Run() {
 				panic("Can't init DB: " + err.Error())
 			}
 		}
+		log.Printf("Storage '%s' has been started", s.name)
 
 		// Слушаем
 		for {
@@ -421,6 +423,8 @@ func (s *Storage) Stop() {
 	if s.leader {
 		for _, conn := range s.engine.replicasRegistry {
 			conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+
+			conn.SetReadDeadline(time.Now().Add(10 * time.Second)) // Ну тут чуть подольше подождем
 			_, _, err := conn.ReadMessage()
 			if err != nil {
 				if err, status := err.(*websocket.CloseError); status && (err.Code == websocket.CloseNormalClosure) {
@@ -432,6 +436,7 @@ func (s *Storage) Stop() {
 	}
 
 	s.cancel()
+	log.Printf("Storage '%s' has been stopped", s.name)
 }
 
 // Сохраняет snapshot, чистит журнал (если надо) и возвращает пару: (название snapshot'а, ошибка | nil)
@@ -605,8 +610,18 @@ func (s *Storage) notifyReplicas(tr *Transaction) error {
 			return err
 		}
 	}
-	log.Print("Transaction has been applied to all replicas!")
 	return nil
+}
+
+func (v *VectorClock) Init(nodes [][]string) {
+	v.mtx.Lock()
+	defer v.mtx.Unlock()
+
+	for _, nodeRow := range nodes {
+		for _, node := range nodeRow {
+			v.vclock[node] = 0
+		}
+	}
 }
 
 func signalHandler(server *http.Server) {
@@ -626,22 +641,11 @@ func signalHandler(server *http.Server) {
 	}()
 }
 
-func (v *VectorClock) Init(nodes [][]string) {
-	v.mtx.Lock()
-	defer v.mtx.Unlock()
-
-	for _, nodeRow := range nodes {
-		for _, node := range nodeRow {
-			v.vclock[node] = 0
-		}
-	}
-}
-
 func main() {
 	mux := http.ServeMux{}
 	nodes := [][]string{{"master", "slave1", "slave2"}}
 
-	router := NewRouter(&mux, nodes)
+	router := NewRouter(&mux, nodes, 3)
 	m := NewStorage(&mux, nodes[0][0], []string{nodes[0][1], nodes[0][2]}, true)
 	s1 := NewStorage(&mux, nodes[0][1], make([]string, 0), false)
 	s2 := NewStorage(&mux, nodes[0][2], make([]string, 0), false)
