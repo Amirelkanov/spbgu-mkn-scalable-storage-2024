@@ -2,14 +2,15 @@ package main
 
 import (
 	"bytes"
-	"github.com/google/uuid"
-	"github.com/paulmach/orb"
-	"github.com/paulmach/orb/geojson"
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
+
+	"github.com/google/uuid"
+	"github.com/paulmach/orb"
+	"github.com/paulmach/orb/geojson"
 )
 
 func postTest(t *testing.T, mux *http.ServeMux, url string, feature *geojson.Feature) {
@@ -106,7 +107,7 @@ func TestComplex(t *testing.T) {
 	s := NewStorage(mux, "test", []string{}, true)
 	snapshotsDir, logFilename := "testSnapshots/", s.name+"_test.ldf"
 
-	go func() { s.Run(snapshotsDir, logFilename) }()
+	go func() { s.Run() }()
 
 	r := NewRouter(mux, [][]string{{"test"}})
 	go func() { r.Run() }()

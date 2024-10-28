@@ -41,8 +41,8 @@ type Router struct {
 }
 
 type Message struct {
-	err  error
-	body []byte
+	Err  error  `json:"err"`
+	Body []byte `json:"body"`
 }
 
 type VectorClock struct {
@@ -222,7 +222,7 @@ func (s *Storage) setupHandlers(mux *http.ServeMux) {
 
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
-				panic(err.Error())
+				panic(err.Error()) // Ну давайте вот это я паникой сделаю, так логичнее
 			}
 			defer conn.Close()
 
@@ -233,18 +233,26 @@ func (s *Storage) setupHandlers(mux *http.ServeMux) {
 				if err != nil {
 					// Если пришло сообщение на завершение, и текущее хранилище - реплика, то завершаемся
 					if err, status := err.(*websocket.CloseError); status && (err.Code == websocket.CloseNormalClosure) {
+						s.Stop()
+						conn.WriteMessage(websocket.CloseNormalClosure, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Replica closed."))
 						return
 					}
-					panic(err.Error())
+					writeError(w, err)
 				}
 
 				var tmpTr Transaction
 				if err = json.Unmarshal(message, &tmpTr); err != nil {
-					panic(err.Error())
+					writeError(w, err)
 				}
 
 				s.engine.transactionCh <- tmpTr
-				<-s.engine.ResponseCh
+				resp := <-s.engine.ResponseCh
+
+				jsonBody, err := json.Marshal(resp)
+				if err != nil {
+					writeError(w, err)
+				}
+				conn.WriteMessage(websocket.TextMessage, jsonBody)
 			}
 		})
 	}
@@ -262,24 +270,24 @@ func (s *Storage) handlePostRequest(w http.ResponseWriter, r *http.Request, acti
 	s.engine.transactionCh <- Transaction{Lsn: s.engine.lsnCounter, Name: s.name, Action: action, Feature: &feature}
 	engineResp := <-s.engine.ResponseCh
 
-	if engineResp.err == nil {
+	if engineResp.Err == nil {
 		w.WriteHeader(http.StatusOK)
 	} else {
-		writeError(w, engineResp.err)
+		writeError(w, engineResp.Err)
 	}
 }
 
 func (s *Storage) handleGetRequest(w http.ResponseWriter, action Action) {
 	s.engine.transactionCh <- Transaction{Name: s.name, Action: action}
 	engineResp := <-s.engine.ResponseCh
-	if engineResp.err == nil {
+	if engineResp.Err == nil {
 		w.WriteHeader(http.StatusOK)
-		_, err := w.Write(engineResp.body)
+		_, err := w.Write(engineResp.Body)
 		if err != nil {
 			panic(err.Error())
 		}
 	} else {
-		writeError(w, engineResp.err)
+		writeError(w, engineResp.Err)
 	}
 }
 
@@ -295,7 +303,7 @@ func (s *Storage) handleTransaction(tr Transaction) {
 
 	msg, err := s.runTransaction(tr)
 	if err != nil {
-		s.engine.ResponseCh <- Message{err: err}
+		s.engine.ResponseCh <- Message{Err: err}
 	} else {
 		if s.leader {
 			logFd, err := os.OpenFile(s.logFilename(), os.O_WRONLY|os.O_APPEND, 0666)
@@ -319,7 +327,7 @@ func (s *Storage) handleTransaction(tr Transaction) {
 			s.engine.lsnCounter++
 		}
 
-		s.engine.ResponseCh <- Message{err: err, body: msg}
+		s.engine.ResponseCh <- Message{Err: err, Body: msg}
 	}
 }
 
@@ -385,9 +393,11 @@ func (s *Storage) Run() {
 	go func() {
 
 		if s.leader {
-			s.connectToReplicas()
+			if err := s.connectToReplicas(); err != nil {
+				panic("Can't init DB: " + err.Error())
+			}
 			if err := s.Init(); err != nil {
-				panic(err.Error())
+				panic("Can't init DB: " + err.Error())
 			}
 		}
 
@@ -407,14 +417,21 @@ func (s *Storage) Run() {
 func (s *Storage) Stop() {
 	log.Printf("Stopping storage '%s'...", s.name)
 
-	s.cancel()
-	// Проходимся по всем подключениям реплик в регистре и посылаем closeMessage
-	// С другой стороны, если реплика получит такое сообщение, то горутина завершится (см. handle /replication)
-	// После чего закрываем подключение
-	for _, conn := range s.engine.replicasRegistry {
-		conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		conn.Close()
+	// Если мы лидер, то перед завершением скажем своим репликам завершиться
+	if s.leader {
+		for _, conn := range s.engine.replicasRegistry {
+			conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				if err, status := err.(*websocket.CloseError); status && (err.Code == websocket.CloseNormalClosure) {
+					continue
+				}
+				panic(err.Error())
+			}
+		}
 	}
+
+	s.cancel()
 }
 
 // Сохраняет snapshot, чистит журнал (если надо) и возвращает пару: (название snapshot'а, ошибка | nil)
@@ -462,29 +479,35 @@ func (s *Storage) runTransaction(transaction Transaction) ([]byte, error) {
 
 	switch transaction.Action {
 	case Insert:
+		if s.leader {
+			if err := s.notifyReplicas(&transaction); err != nil {
+				return nil, err
+			}
+		}
+
 		s.featuresPrimInd[transaction.Feature.ID.(string)] = transaction.Feature
 		s.featuresRTree.Insert(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
-
-		if s.leader {
-			s.notifyReplicas(&transaction)
-		}
 	case Replace:
+		if s.leader {
+			if err := s.notifyReplicas(&transaction); err != nil {
+				return nil, err
+			}
+		}
+
 		s.featuresPrimInd[transaction.Feature.ID.(string)] = transaction.Feature
 		s.featuresRTree.Replace(
 			transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, s.featuresPrimInd[transaction.Feature.ID.(string)],
 			transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature,
 		)
-
-		if s.leader {
-			s.notifyReplicas(&transaction)
-		}
 	case Delete:
+		if s.leader {
+			if err := s.notifyReplicas(&transaction); err != nil {
+				return nil, err
+			}
+		}
+
 		delete(s.featuresPrimInd, transaction.Feature.ID.(string))
 		s.featuresRTree.Delete(transaction.Feature.Geometry.Bound().Min, transaction.Feature.Geometry.Bound().Max, transaction.Feature)
-
-		if s.leader {
-			s.notifyReplicas(&transaction)
-		}
 	case Snapshot:
 		snapshotFilename, err := s.saveSnapshot()
 		return []byte("Snapshot '" + snapshotFilename + "' has been saved!"), err
@@ -534,39 +557,56 @@ func (s *Storage) runTransactionsFromFile(filename string) error {
 	return nil
 }
 
-func (s *Storage) connectToReplicas() {
+func (s *Storage) connectToReplicas() error {
 	if !s.leader {
-		return
+		return errors.New(s.name + " is not a leader")
 	}
 	for _, replica := range s.replicas {
-		// Установить соединение с репликой по WebSocket
-		conn, _, err := websocket.DefaultDialer.Dial("ws://localhost"+port+"/"+replica+"/replication", nil)
+		conn, _, err := websocket.DefaultDialer.Dial("ws://127.0.0.1"+port+"/"+replica+"/replication", nil)
 		if err != nil {
-			log.Printf("Can't connect to replica '%s': %v", replica, err)
-			return
+			return err
 		}
 		s.engine.replicasRegistry[replica] = conn
 	}
+	return nil
 }
 
-// Передаем транзакцию репликам
-func (s *Storage) notifyReplicas(tr *Transaction) {
+// Передаем транзакцию от мастера репликам
+func (s *Storage) notifyReplicas(tr *Transaction) error {
 	if err := s.leaderCheck(); err != nil {
 		panic(err.Error())
 	}
-	json, err := json.Marshal(tr)
+	jsonBody, err := json.Marshal(tr)
 	if err != nil {
 		panic(err.Error())
 	}
 
-	for replica, conn := range s.engine.replicasRegistry {
-		err = conn.WriteMessage(websocket.TextMessage, json)
+	for _, conn := range s.engine.replicasRegistry {
+		// Если не можем отослать сообщение какой-нибудь реплике,
+		// то т.к. репликация синхронная, для нас это трагедия (была бы асинхронной, продолжили бы цикл просто)
+		err = conn.WriteMessage(websocket.TextMessage, jsonBody)
 		if err != nil {
-			log.Printf("Can't send transaction to replica: '%s': %v", replica, err)
-			conn.Close()
-			delete(s.engine.replicasRegistry, replica)
+			return err
+		}
+
+		// Ждем 2 секунды ответа от реплики. Если она так и не ответила, выведем ошибку
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+
+		// Если получили сообщение, считаем, и глянем, вернулась ли ошибка
+		var tmpMsg Message
+		if err = json.Unmarshal(message, &tmpMsg); err != nil {
+			return err
+		}
+		if tmpMsg.Err != nil {
+			return err
 		}
 	}
+	log.Print("Transaction has been applied to all replicas!")
+	return nil
 }
 
 func signalHandler(server *http.Server) {
@@ -609,17 +649,13 @@ func main() {
 	VClock.Init(nodes)
 
 	router.Run()
-	defer router.Stop()
 
 	m.Run()
-	defer m.Stop()
 	s1.Run()
-	defer s1.Stop()
 	s2.Run()
-	defer s2.Stop()
 
 	server := http.Server{
-		Addr:    "localhost" + port,
+		Addr:    "127.0.0.1" + port,
 		Handler: &mux,
 	}
 	signalHandler(&server)
@@ -627,8 +663,11 @@ func main() {
 	log.Printf("Listen http://%s", server.Addr)
 	err := server.ListenAndServe()
 	if !errors.Is(err, http.ErrServerClosed) {
-		log.Printf("err", "err", err)
+		log.Fatal(err.Error())
 	}
 
-	defer log.Print("Shutting down...")
+	router.Stop()
+	m.Stop()
+
+	log.Print("Shutting down...")
 }
